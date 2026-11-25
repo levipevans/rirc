@@ -4,14 +4,15 @@
 
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::mpsc::Sender;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf,
+};
 use tokio::net::TcpStream;
 use tokio::runtime::Handle;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{unbounded_channel, Sender, UnboundedSender};
 use tokio::time::{timeout, Instant};
 
 #[derive(Debug, Clone)]
@@ -260,6 +261,32 @@ async fn open(host: &str, port: u16, tls: bool) -> Result<Stream, String> {
     Err(last_err)
 }
 
+async fn read_frame<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    const MAX_FRAME_BYTES: usize = 16 * 1024;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(buf.len());
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map(|pos| pos + 1).unwrap_or(available.len());
+        if buf.len() + take > MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IRC frame exceeds 16 KiB",
+            ));
+        }
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(buf.len());
+        }
+    }
+}
+
 async fn run(
     server: usize,
     token: u64,
@@ -272,22 +299,28 @@ async fn run(
     let stream = match open(host, port, tls).await {
         Ok(stream) => stream,
         Err(e) => {
-            let _ = events.send(NetEvent::Error {
-                server,
-                token,
-                message: e,
-            });
+            let _ = events
+                .send(NetEvent::Error {
+                    server,
+                    token,
+                    message: e,
+                })
+                .await;
             return;
         }
     };
 
-    if events.send(NetEvent::Connected { server, token }).is_err() {
+    if events
+        .send(NetEvent::Connected { server, token })
+        .await
+        .is_err()
+    {
         return;
     }
 
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut frame = Vec::new();
     let mut keepalive = tokio::time::interval_at(
         Instant::now() + Duration::from_secs(120),
         Duration::from_secs(120),
@@ -316,27 +349,29 @@ async fn run(
                             server,
                             token,
                             reason: "client closed".to_string(),
-                        });
+                        }).await;
                         return;
                     }
                 }
             }
 
-            read = reader.read_line(&mut line) => {
+            read = read_frame(&mut reader, &mut frame) => {
                 match read {
                     Ok(0) => {
                         let _ = events.send(NetEvent::Closed {
                             server,
                             token,
                             reason: "server closed the connection".to_string(),
-                        });
+                        }).await;
                         return;
                     }
                     Ok(_) => {
-                        let raw = line.trim_end_matches(['\r', '\n']).to_string();
-                        line.clear();
+                        let raw = String::from_utf8_lossy(&frame)
+                            .trim_end_matches(['\r', '\n'])
+                            .to_string();
+                        frame.clear();
                         if !raw.is_empty() {
-                            let _ = events.send(NetEvent::Line { server, token, line: raw });
+                            let _ = events.send(NetEvent::Line { server, token, line: raw }).await;
                         }
                     }
                     Err(e) => {
@@ -344,7 +379,7 @@ async fn run(
                             server,
                             token,
                             reason: format!("read error: {e}"),
-                        });
+                        }).await;
                         return;
                     }
                 }
@@ -359,16 +394,35 @@ async fn run(
         }
     }
 
-    let _ = events.send(NetEvent::Closed {
-        server,
-        token,
-        reason: "connection lost".to_string(),
-    });
+    let _ = events
+        .send(NetEvent::Closed {
+            server,
+            token,
+            reason: "connection lost".to_string(),
+        })
+        .await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc::{channel, error::TryRecvError, Receiver};
+
+    fn recv_timeout(rx: &mut Receiver<NetEvent>, timeout: Duration) -> Option<NetEvent> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match rx.try_recv() {
+                Ok(event) => return Some(event),
+                Err(TryRecvError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(TryRecvError::Disconnected) => return None,
+            }
+        }
+    }
 
     #[test]
     fn parses_tags_prefix_and_trailing() {
@@ -404,7 +458,6 @@ mod tests {
     fn speaks_to_a_local_server() {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
-        use std::sync::mpsc::channel;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -413,12 +466,10 @@ mod tests {
             .worker_threads(1)
             .build()
             .unwrap();
-        let (events, rx) = channel();
+        let (events, mut rx) = channel(64);
         let outbound = connect(rt.handle(), 5, 1, "127.0.0.1", addr.port(), false, events);
 
-        let first = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("connected event");
+        let first = recv_timeout(&mut rx, Duration::from_secs(5)).expect("connected event");
         assert!(matches!(
             first,
             NetEvent::Connected {
@@ -446,24 +497,78 @@ mod tests {
         assert_eq!(lines[0], "NICK tester");
         assert_eq!(lines[1], "USER tester 0 * :tester");
 
-        socket.write_all(b":srv 001 tester :Welcome\r\n").unwrap();
+        // A frame split across writes must stay one frame.
+        socket.write_all(b":srv 001 tester :Wel").unwrap();
+        socket.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        socket.write_all(b"come\r\n").unwrap();
         socket.flush().unwrap();
 
-        loop {
-            match rx.recv_timeout(Duration::from_secs(5)).expect("line event") {
-                NetEvent::Line { line, .. } => {
-                    assert_eq!(line, ":srv 001 tester :Welcome");
-                    break;
+        let line = loop {
+            match recv_timeout(&mut rx, Duration::from_secs(5)) {
+                Some(NetEvent::Line { line, .. }) => break line,
+                Some(_) => continue,
+                None => panic!("timed out waiting for welcome"),
+            }
+        };
+        assert_eq!(line, ":srv 001 tester :Welcome");
+
+        // Invalid UTF-8 must not kill the connection; following frames survive.
+        socket
+            .write_all(b":srv NOTICE tester :caf\xe9\r\n")
+            .unwrap();
+        socket
+            .write_all(b":srv NOTICE tester :still-here\r\n")
+            .unwrap();
+        socket.flush().unwrap();
+
+        let mut notices = Vec::new();
+        while notices.len() < 2 {
+            match recv_timeout(&mut rx, Duration::from_secs(5)) {
+                Some(NetEvent::Line { line, .. }) => {
+                    if line.contains("caf") || line.contains("still-here") {
+                        notices.push(line);
+                    }
                 }
-                _ => continue,
+                Some(NetEvent::Closed { reason, .. }) => panic!("disconnected: {reason}"),
+                Some(_) => {}
+                None => panic!("timed out waiting for lossy notice"),
             }
         }
+        assert!(notices[0].contains("caf"));
+        assert!(notices[1].contains("still-here"));
+    }
+
+    #[test]
+    fn frame_reader_is_bounded_and_framed() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let data = b"one\r\ntwo\r\n";
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        assert_eq!(
+            rt.block_on(read_frame(&mut reader, &mut buf)).unwrap(),
+            buf.len()
+        );
+        assert_eq!(String::from_utf8_lossy(&buf), "one\r\n");
+        buf.clear();
+        rt.block_on(read_frame(&mut reader, &mut buf)).unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf), "two\r\n");
+        buf.clear();
+        assert_eq!(rt.block_on(read_frame(&mut reader, &mut buf)).unwrap(), 0);
+
+        let oversized = vec![b'a'; 16 * 1024 + 1];
+        let mut reader = BufReader::new(&oversized[..]);
+        let mut buf = Vec::new();
+        assert!(rt.block_on(read_frame(&mut reader, &mut buf)).is_err());
     }
 
     #[test]
     #[ignore = "requires outbound internet access; run sparingly (networks may ban automated probes)"]
     fn connects_to_libera_over_tls() {
-        use std::sync::mpsc::channel;
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -471,13 +576,13 @@ mod tests {
             .worker_threads(1)
             .build()
             .unwrap();
-        let (events, rx) = channel();
+        let (events, mut rx) = channel(64);
         let outbound = connect(rt.handle(), 9, 1, "irc.libera.chat", 6697, true, events);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(25);
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
-            match rx.recv_timeout(left).expect("connect event") {
+            match recv_timeout(&mut rx, left).expect("connect event") {
                 NetEvent::Connected { .. } => break,
                 NetEvent::Error { message, .. } => panic!("TLS connect failed: {message}"),
                 _ => continue,
@@ -496,10 +601,7 @@ mod tests {
             .unwrap();
 
         loop {
-            match rx
-                .recv_timeout(Duration::from_secs(25))
-                .expect("welcome event")
-            {
+            match recv_timeout(&mut rx, Duration::from_secs(25)).expect("welcome event") {
                 NetEvent::Line { line, .. } => {
                     if line.contains(" 001 ") || line.contains(" 433 ") {
                         println!("registration response: {line}");

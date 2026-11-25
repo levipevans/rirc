@@ -162,24 +162,31 @@ pub fn sanitize_line(text: &str) -> String {
 
 /// Split an outgoing message into IRC-sized chunks, preferring word boundaries.
 pub fn irc_chunks(text: &str, max: usize) -> Vec<String> {
-    let max = max.max(1);
+    let max = max.max(4);
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
+    let mut current_bytes = 0usize;
     for word in text.split_inclusive(' ') {
-        if !current.is_empty() && current.chars().count() + word.chars().count() > max {
+        let word_bytes = word.len();
+        if !current.is_empty() && current_bytes + word_bytes > max {
             out.push(current.trim_end().to_string());
             current.clear();
+            current_bytes = 0;
         }
-        if word.chars().count() > max {
+        if word_bytes > max {
             for ch in word.chars() {
-                if current.chars().count() >= max {
+                let char_bytes = ch.len_utf8();
+                if !current.is_empty() && current_bytes + char_bytes > max {
                     out.push(current.clone());
                     current.clear();
+                    current_bytes = 0;
                 }
                 current.push(ch);
+                current_bytes += char_bytes;
             }
         } else {
             current.push_str(word);
+            current_bytes += word_bytes;
         }
     }
     if !current.trim().is_empty() {
@@ -279,11 +286,16 @@ mod tests {
     #[test]
     fn chunks_long_messages() {
         let chunks = irc_chunks("the quick brown fox jumps over the lazy dog", 12);
-        assert!(chunks.iter().all(|c| c.chars().count() <= 12));
+        assert!(chunks.iter().all(|c| c.len() <= 12));
         assert_eq!(
             chunks.join(" "),
             "the quick brown fox jumps over the lazy dog"
         );
+
+        let text = "é".repeat(300);
+        let chunks = irc_chunks(&text, 100);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 100));
+        assert_eq!(chunks.concat(), text);
     }
 
     #[test]

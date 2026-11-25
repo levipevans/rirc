@@ -1,11 +1,15 @@
 //! Data model: servers, buffers, messages and channel members.
 
+use std::time::Instant;
+
 use chrono::{DateTime, Local};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::util;
 
 pub const MAX_MESSAGES: usize = 4000;
+pub const MAX_BUFFERS_PER_SERVER: usize = 512;
+pub const MAX_MEMBERS_PER_CHANNEL: usize = 5000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MsgKind {
@@ -248,6 +252,16 @@ impl Whois {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaslState {
+    None,
+    Requested,
+    AwaitingChallenge,
+    AwaitingResult,
+    Authenticated,
+    Failed,
+}
+
 #[derive(Debug)]
 pub struct Server {
     pub id: usize,
@@ -266,6 +280,7 @@ pub struct Server {
     pub network: Option<String>,
     pub prefix_modes: Vec<(char, char)>,
     pub chantypes: Vec<char>,
+    pub statusmsg: Vec<char>,
     pub tx: Option<UnboundedSender<String>>,
     pub sasl: Option<(String, String)>,
     pub pass: Option<String>,
@@ -274,7 +289,8 @@ pub struct Server {
     pub cap_offered: Vec<String>,
     pub cap_requested: bool,
     pub caps_done: bool,
-    pub sasl_wait: bool,
+    pub sasl_state: SaslState,
+    pub last_version_reply: Option<Instant>,
     pub whois: Option<Whois>,
     pub user_modes: String,
 }
@@ -302,6 +318,7 @@ impl Server {
             network: None,
             prefix_modes: vec![('o', '@'), ('v', '+')],
             chantypes: vec!['#'],
+            statusmsg: vec!['@', '+'],
             tx: None,
             sasl: None,
             pass: None,
@@ -310,7 +327,8 @@ impl Server {
             cap_offered: Vec::new(),
             cap_requested: false,
             caps_done: false,
-            sasl_wait: false,
+            sasl_state: SaslState::None,
+            last_version_reply: None,
             whois: None,
             user_modes: String::new(),
         }
@@ -351,6 +369,25 @@ impl Server {
             .next()
             .map(|c| self.chantypes.contains(&c) || self.chantypes.is_empty() && c == '#')
             .unwrap_or(false)
+    }
+
+    /// Resolve a PRIVMSG/NOTICE target to a channel buffer name and optional
+    /// STATUSMSG prefix (for example `@#rust` -> (`#rust`, Some('@'))).
+    pub fn channel_target(&self, target: &str) -> Option<(String, Option<char>)> {
+        if target.is_empty() {
+            return None;
+        }
+        if self.is_channel_name(target) {
+            return Some((target.to_string(), None));
+        }
+        let first = target.chars().next()?;
+        if self.statusmsg.contains(&first) {
+            let rest = &target[first.len_utf8()..];
+            if self.is_channel_name(rest) {
+                return Some((rest.to_string(), Some(first)));
+            }
+        }
+        None
     }
 
     pub fn rank_for(&self, prefixes: &str) -> usize {

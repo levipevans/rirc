@@ -14,7 +14,6 @@ mod ui;
 mod util;
 
 use std::io;
-use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
@@ -31,6 +30,7 @@ use ratatui::Terminal;
 
 use crate::app::App;
 use crate::irc::NetEvent;
+use tokio::sync::mpsc::{self, error::TryRecvError, Receiver};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -58,7 +58,7 @@ fn main() {
         .worker_threads(2)
         .build()
         .expect("failed to start async runtime");
-    let (net_tx, net_rx) = mpsc::channel();
+    let (net_tx, mut net_rx) = mpsc::channel(1024);
     let mut app = App::new(cfg.clone(), Some(runtime.handle().clone()), net_tx);
 
     if cfg.snapshot {
@@ -141,7 +141,7 @@ fn main() {
     }
 
     install_panic_hook();
-    if let Err(error) = run(&mut app, net_rx) {
+    if let Err(error) = run(&mut app, &mut net_rx) {
         eprintln!("rirc: {error}");
         std::process::exit(1);
     }
@@ -197,7 +197,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     let _ = terminal.show_cursor();
 }
 
-fn run(app: &mut App, net_rx: Receiver<NetEvent>) -> io::Result<()> {
+fn run(app: &mut App, net_rx: &mut Receiver<NetEvent>) -> io::Result<()> {
     let mut terminal = match setup_terminal() {
         Ok(terminal) => terminal,
         Err(error) => {
@@ -205,19 +205,26 @@ fn run(app: &mut App, net_rx: Receiver<NetEvent>) -> io::Result<()> {
             return Err(error);
         }
     };
-    let result = event_loop(app, &net_rx, &mut terminal);
+    let result = event_loop(app, net_rx, &mut terminal);
     restore_terminal(&mut terminal);
     result
 }
 
 fn event_loop(
     app: &mut App,
-    net_rx: &Receiver<NetEvent>,
+    net_rx: &mut Receiver<NetEvent>,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> io::Result<()> {
     loop {
-        for event in net_rx.try_iter() {
-            app.on_net(event);
+        let mut processed = 0usize;
+        while processed < 512 {
+            match net_rx.try_recv() {
+                Ok(event) => {
+                    app.on_net(event);
+                    processed += 1;
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
         }
         app.tick();
         terminal.draw(|frame| ui::draw(frame, app))?;

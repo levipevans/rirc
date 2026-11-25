@@ -51,7 +51,9 @@ cargo run --release -- -s irc.libera.chat -n mynick -c '#rust,#vim'
 The binary is `target/release/rirc.exe` (Windows) or `target/release/rirc`.
 TLS is used by default (port 6697). For systems without a system certificate
 store setup, `native-tls` uses schannel on Windows and Security.framework on
-macOS; on Linux install OpenSSL development headers.
+macOS; on Linux install OpenSSL development headers. `PASS` and SASL
+credentials are refused unless TLS is enabled, and existing connections are
+not reused when the requested transport differs.
 
 ### Options
 
@@ -113,7 +115,7 @@ outer terminal.
 ## Commands
 
 ```
-/join [#chan[,chan]]     /part [#chan] [reason]    /me <action>
+/join #chan[,#chan] [keys]   /part [#chan] [reason]    /me <action>
 /msg <nick> [text]       /query <nick>             /nick <newnick>
 /topic [text]            /mode <target> <modes>    /whois <nick>
 /away [reason]           /invite <nick> [#chan]    /kick <nick> [reason]

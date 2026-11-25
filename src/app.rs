@@ -1,13 +1,13 @@
 //! Application state and behaviour: buffers, incoming IRC events, commands,
 //! menus, mouse handling and mode routing.
 
-use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use chrono::Local;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use tokio::runtime::Handle;
+use tokio::sync::mpsc::Sender;
 
 use crate::config::{Config, ServerConfig};
 use crate::input::Input;
@@ -243,7 +243,12 @@ impl App {
         self.servers[pos].caps_done = false;
         self.servers[pos].cap_requested = false;
         self.servers[pos].cap_offered.clear();
-        self.servers[pos].sasl_wait = false;
+        self.servers[pos].sasl_state = if self.servers[pos].sasl.is_some() {
+            SaslState::Requested
+        } else {
+            SaslState::None
+        };
+        self.servers[pos].last_version_reply = None;
         let token = self.servers[pos].token;
         let (host, port, tls) = (
             self.servers[pos].host.clone(),
@@ -334,6 +339,14 @@ impl App {
         if let Some(idx) = self.find_channel(sid, &name) {
             return idx;
         }
+        let count = self
+            .buffers
+            .iter()
+            .filter(|buffer| buffer.server == sid)
+            .count();
+        if count >= MAX_BUFFERS_PER_SERVER {
+            return self.ensure_server_buffer(sid);
+        }
         self.create_buffer(
             sid,
             BufferKind::Channel {
@@ -351,6 +364,14 @@ impl App {
         let nick = util::sanitize_line(nick);
         if let Some(idx) = self.find_query(sid, &nick) {
             return idx;
+        }
+        let count = self
+            .buffers
+            .iter()
+            .filter(|buffer| buffer.server == sid)
+            .count();
+        if count >= MAX_BUFFERS_PER_SERVER {
+            return self.ensure_server_buffer(sid);
         }
         let mut member = Member::new(nick.clone(), "");
         for buffer in &self.buffers {
@@ -568,6 +589,11 @@ impl App {
     // ------------------------------------------------------------- network ---
 
     pub fn send(&mut self, sid: usize, line: impl Into<String>) {
+        let line = line.into();
+        if let Err(reason) = validate_outgoing(&line) {
+            self.toast(reason);
+            return;
+        }
         if !self.send_silent(sid, line) {
             self.toast("not connected");
         }
@@ -575,6 +601,10 @@ impl App {
 
     fn send_silent(&mut self, sid: usize, line: impl Into<String>) -> bool {
         let line = line.into();
+        if let Err(reason) = validate_outgoing(&line) {
+            self.toast(reason);
+            return false;
+        }
         if let Some(server) = self.server_mut(sid) {
             if server.demo {
                 return true;
@@ -683,10 +713,20 @@ impl App {
     }
 
     fn begin_registration(&mut self, sid: usize) {
-        let (nick, pass) = match self.server(sid) {
-            Some(s) => (s.nick.clone(), s.pass.clone()),
+        let (nick, pass, has_sasl, tls) = match self.server(sid) {
+            Some(s) => (s.nick.clone(), s.pass.clone(), s.sasl.is_some(), s.tls),
             None => return,
         };
+        if (pass.is_some() || has_sasl) && !tls {
+            self.server_msg(
+                sid,
+                MsgKind::Error,
+                "Refusing to send credentials over a plaintext connection",
+            );
+            self.toast("refusing to send credentials over plaintext");
+            self.disconnect_server(sid);
+            return;
+        }
         if let Some(pass) = pass {
             self.send(sid, format!("PASS {pass}"));
         }
@@ -697,7 +737,11 @@ impl App {
             s.cap_offered.clear();
             s.cap_requested = false;
             s.caps_done = false;
-            s.sasl_wait = false;
+            s.sasl_state = if has_sasl {
+                SaslState::Requested
+            } else {
+                SaslState::None
+            };
         }
     }
 
@@ -720,6 +764,7 @@ impl App {
             "away-notify",
             "extended-join",
             "account-tag",
+            "account-notify",
         ] {
             if has(cap) {
                 want.push(cap);
@@ -732,6 +777,11 @@ impl App {
             s.cap_requested = true;
         }
         if want.is_empty() {
+            if wants_sasl {
+                if let Some(s) = self.server_mut(sid) {
+                    s.sasl_state = SaslState::Failed;
+                }
+            }
             self.cap_end(sid);
         } else {
             self.send(sid, format!("CAP REQ :{}", want.join(" ")));
@@ -745,9 +795,28 @@ impl App {
         }
         if let Some(s) = self.server_mut(sid) {
             s.caps_done = true;
-            s.sasl_wait = false;
         }
         self.send(sid, "CAP END");
+    }
+
+    fn send_sasl_payload(&mut self, sid: usize, user: &str, pass: &str) {
+        let payload = format!("{user}\0{user}\0{pass}");
+        let encoded = util::base64(payload.as_bytes());
+        if encoded.is_empty() {
+            self.send(sid, "AUTHENTICATE +");
+            return;
+        }
+        let bytes = encoded.as_bytes();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let end = (offset + 400).min(bytes.len());
+            let chunk = std::str::from_utf8(&bytes[offset..end]).unwrap_or_default();
+            self.send(sid, format!("AUTHENTICATE {chunk}"));
+            offset = end;
+        }
+        if encoded.len() % 400 == 0 {
+            self.send(sid, "AUTHENTICATE +");
+        }
     }
 
     fn handle_cap(&mut self, sid: usize, msg: &IrcMessage) {
@@ -773,11 +842,23 @@ impl App {
                 let sasl_acked = acked
                     .split_whitespace()
                     .any(|cap| cap == "sasl" || cap.starts_with("sasl="));
-                if sasl && sasl_acked {
-                    if let Some(s) = self.server_mut(sid) {
-                        s.sasl_wait = true;
+                if sasl {
+                    if sasl_acked {
+                        if let Some(s) = self.server_mut(sid) {
+                            s.sasl_state = SaslState::AwaitingChallenge;
+                        }
+                        self.send(sid, "AUTHENTICATE PLAIN");
+                    } else {
+                        if let Some(s) = self.server_mut(sid) {
+                            s.sasl_state = SaslState::Failed;
+                        }
+                        self.server_msg(
+                            sid,
+                            MsgKind::Info,
+                            "SASL was requested but the server did not acknowledge it",
+                        );
+                        self.cap_end(sid);
                     }
-                    self.send(sid, "AUTHENTICATE PLAIN");
                 } else {
                     self.cap_end(sid);
                 }
@@ -790,6 +871,12 @@ impl App {
                         MsgKind::Info,
                         format!("Server refused capabilities: {denied}"),
                     );
+                }
+                let sasl = self.server(sid).map(|s| s.sasl.is_some()).unwrap_or(false);
+                if sasl {
+                    if let Some(s) = self.server_mut(sid) {
+                        s.sasl_state = SaslState::Failed;
+                    }
                 }
                 self.cap_end(sid);
             }
@@ -810,12 +897,14 @@ impl App {
             "CAP" => self.handle_cap(sid, &msg),
             "AUTHENTICATE" => {
                 if msg.param(0) == Some("+") {
-                    if let Some((user, pass)) = self.server(sid).and_then(|s| s.sasl.clone()) {
-                        let payload = format!("{user}\0{user}\0{pass}");
-                        self.send(
-                            sid,
-                            format!("AUTHENTICATE {}", util::base64(payload.as_bytes())),
-                        );
+                    let state = self.server(sid).map(|s| s.sasl_state);
+                    if state == Some(SaslState::AwaitingChallenge) {
+                        if let Some((user, pass)) = self.server(sid).and_then(|s| s.sasl.clone()) {
+                            if let Some(s) = self.server_mut(sid) {
+                                s.sasl_state = SaslState::AwaitingResult;
+                            }
+                            self.send_sasl_payload(sid, &user, &pass);
+                        }
                     }
                 }
             }
@@ -881,7 +970,7 @@ impl App {
 
     fn on_welcome(&mut self, sid: usize, msg: &IrcMessage) {
         let nick = msg.param(0).unwrap_or("").to_string();
-        let autojoins = {
+        let (autojoins, sasl_required, authenticated) = {
             let Some(server) = self.server_mut(sid) else {
                 return;
             };
@@ -889,7 +978,11 @@ impl App {
             server.connected = true;
             server.registered = true;
             server.connecting = false;
-            server.autojoins.clone()
+            (
+                server.autojoins.clone(),
+                server.sasl.is_some(),
+                server.sasl_state == SaslState::Authenticated,
+            )
         };
         let label = self
             .server(sid)
@@ -905,8 +998,17 @@ impl App {
                 *title = label;
             }
         }
-        for channel in autojoins {
-            self.send(sid, format!("JOIN {channel}"));
+        if sasl_required && !authenticated {
+            self.server_msg(
+                sid,
+                MsgKind::Error,
+                "SASL did not complete; automatic joins were skipped",
+            );
+            self.toast("SASL failed; autojoin skipped");
+        } else {
+            for channel in autojoins {
+                self.send(sid, format!("JOIN {channel}"));
+            }
         }
     }
 
@@ -921,7 +1023,8 @@ impl App {
             .and_then(util::parse_server_time)
             .unwrap_or_else(Local::now);
 
-        let mut kind = if msg.command == "NOTICE" {
+        let is_notice = msg.command == "NOTICE";
+        let mut kind = if is_notice {
             MsgKind::Notice
         } else {
             MsgKind::Privmsg
@@ -936,31 +1039,58 @@ impl App {
                 let name = inner.split(' ').next().unwrap_or("CTCP");
                 if !own {
                     self.server_msg(sid, MsgKind::Info, format!("CTCP {name} from {nick}"));
-                    if name.eq_ignore_ascii_case("VERSION") && !nick.is_empty() {
-                        self.send(
-                            sid,
-                            format!(
-                                "NOTICE {nick} :\u{1}VERSION rirc {}\u{1}",
-                                env!("CARGO_PKG_VERSION")
-                            ),
-                        );
+                    if name.eq_ignore_ascii_case("VERSION")
+                        && !is_notice
+                        && !nick.is_empty()
+                        && util::fold(&target) == util::fold(&my_nick)
+                    {
+                        let allowed = self
+                            .server_mut(sid)
+                            .map(|server| {
+                                let now = Instant::now();
+                                let allowed = server
+                                    .last_version_reply
+                                    .map(|last| now.duration_since(last) >= Duration::from_secs(30))
+                                    .unwrap_or(true);
+                                if allowed {
+                                    server.last_version_reply = Some(now);
+                                }
+                                allowed
+                            })
+                            .unwrap_or(false);
+                        if allowed {
+                            self.send(
+                                sid,
+                                format!(
+                                    "NOTICE {nick} :\u{1}VERSION rirc {}\u{1}",
+                                    env!("CARGO_PKG_VERSION")
+                                ),
+                            );
+                        }
                     }
                 }
                 return;
             }
         }
 
-        let is_channel = self
+        let target_channel = self
             .server(sid)
-            .map(|s| s.is_channel_name(&target))
-            .unwrap_or_else(|| target.starts_with('#'));
+            .and_then(|server| server.channel_target(&target));
         let from_user = msg
             .prefix
             .as_deref()
             .map(|p| p.contains('!'))
             .unwrap_or(false);
-        let bid = if is_channel {
-            self.ensure_channel(sid, &target)
+        let bid = if target.contains(',') {
+            let bid = self.ensure_server_buffer(sid);
+            text = format!("[group target {target}] {text}");
+            bid
+        } else if let Some((channel, status)) = target_channel {
+            let bid = self.ensure_channel(sid, &channel);
+            if let Some(prefix) = status {
+                text = format!("[{prefix}{channel}] {text}");
+            }
+            bid
         } else if from_user && util::fold(&target) == util::fold(&my_nick) {
             self.ensure_query(sid, &nick)
         } else if from_user && target != "*" {
@@ -969,7 +1099,12 @@ impl App {
             self.ensure_server_buffer(sid)
         };
 
-        if is_channel && !nick.is_empty() {
+        let in_channel = self
+            .buffers
+            .get(bid)
+            .map(|buffer| buffer.is_channel())
+            .unwrap_or(false);
+        if in_channel && !nick.is_empty() {
             self.merge_member(bid, &nick, "", false, None, None);
         }
         if let Some(account) = msg.tag("account") {
@@ -1524,11 +1659,17 @@ impl App {
                 self.server_msg(sid, MsgKind::Info, text);
             }
             "903" => {
+                if let Some(s) = self.server_mut(sid) {
+                    s.sasl_state = SaslState::Authenticated;
+                }
                 self.server_msg(sid, MsgKind::Info, "SASL authentication successful");
                 self.cap_end(sid);
             }
-            "904" | "905" | "906" | "907" => {
+            "902" | "904" | "905" | "906" | "907" => {
                 let text = msg.trailing().to_string();
+                if let Some(s) = self.server_mut(sid) {
+                    s.sasl_state = SaslState::Failed;
+                }
                 self.server_msg(sid, MsgKind::Error, format!("SASL failed: {text}"));
                 self.cap_end(sid);
             }
@@ -1577,25 +1718,30 @@ impl App {
         let mut network: Option<String> = None;
         let mut prefixes: Option<Vec<(char, char)>> = None;
         let mut chantypes: Option<Vec<char>> = None;
+        let mut statusmsg: Option<Vec<char>> = None;
         for token in msg.params.iter().skip(1) {
             if let Some(value) = token.strip_prefix("NETWORK=") {
                 network = Some(util::sanitize_line(value));
             } else if let Some(value) = token.strip_prefix("PREFIX=") {
-                if let Some(open) = value.find('(') {
-                    if let Some(close) = value.find(')') {
-                        let modes: Vec<char> = value[open + 1..close].chars().collect();
-                        let symbols: Vec<char> = value[close + 1..].chars().collect();
-                        let mut map = Vec::new();
-                        for (mode, symbol) in modes.iter().zip(symbols.iter()) {
-                            map.push((*mode, *symbol));
-                        }
-                        if !map.is_empty() {
-                            prefixes = Some(map);
+                if let Some(rest) = value.strip_prefix('(') {
+                    if let Some((modes_str, symbols_str)) = rest.split_once(')') {
+                        let modes: Vec<char> = modes_str.chars().collect();
+                        let symbols: Vec<char> =
+                            symbols_str.chars().filter(|c| !c.is_whitespace()).collect();
+                        if !modes.is_empty() && modes.len() == symbols.len() && modes.len() <= 16 {
+                            prefixes = Some(modes.into_iter().zip(symbols).collect());
                         }
                     }
                 }
             } else if let Some(value) = token.strip_prefix("CHANTYPES=") {
                 chantypes = Some(value.chars().collect());
+            } else if let Some(value) = token.strip_prefix("STATUSMSG=") {
+                statusmsg = Some(
+                    value
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect::<Vec<_>>(),
+                );
             }
         }
         if let Some(server) = self.server_mut(sid) {
@@ -1607,6 +1753,9 @@ impl App {
             }
             if let Some(chantypes) = chantypes {
                 server.chantypes = chantypes;
+            }
+            if let Some(statusmsg) = statusmsg {
+                server.statusmsg = statusmsg;
             }
         }
         if let Some(network) = network {
@@ -1785,6 +1934,9 @@ impl App {
                 member.realname = realname;
             }
         } else {
+            if members.len() >= MAX_MEMBERS_PER_CHANNEL {
+                return;
+            }
             let mut member = Member::new(clean_nick, prefixes);
             member.account = account;
             member.realname = realname;
@@ -1941,6 +2093,7 @@ impl App {
                 }
                 return;
             }
+            list.normalize_selection();
             match key.code {
                 KeyCode::Esc => {
                     if !list.filter.is_empty() {
@@ -2251,6 +2404,43 @@ impl App {
 
     // ----------------------------------------------------------- messaging ---
 
+    fn message_byte_budget(target: &str, action: bool) -> usize {
+        let overhead = if action {
+            format!("PRIVMSG {target} :\u{1}ACTION \u{1}").len()
+        } else {
+            format!("PRIVMSG {target} :").len()
+        };
+        510usize.saturating_sub(overhead).clamp(32, 400)
+    }
+
+    fn send_privmsg_to(&mut self, sid: usize, bid: usize, target: &str, text: &str) -> bool {
+        let nick = self.nick_of(sid);
+        let chunks = util::irc_chunks(text, Self::message_byte_budget(target, false));
+        for chunk in &chunks {
+            if !self.send_silent(sid, format!("PRIVMSG {target} :{chunk}")) {
+                return false;
+            }
+            let mut message = Message::new(MsgKind::Privmsg, Some(&nick), chunk.as_str());
+            message.own = true;
+            self.push_msg(bid, message);
+        }
+        true
+    }
+
+    fn send_action_to(&mut self, sid: usize, bid: usize, target: &str, text: &str) -> bool {
+        let nick = self.nick_of(sid);
+        let chunks = util::irc_chunks(text, Self::message_byte_budget(target, true));
+        for chunk in &chunks {
+            if !self.send_silent(sid, format!("PRIVMSG {target} :\u{1}ACTION {chunk}\u{1}")) {
+                return false;
+            }
+            let mut message = Message::new(MsgKind::Action, Some(&nick), chunk.as_str());
+            message.own = true;
+            self.push_msg(bid, message);
+        }
+        true
+    }
+
     pub fn send_chat(&mut self, text: &str) {
         let Some(bid) = self.active else { return };
         let (sid, target, is_server) = {
@@ -2261,26 +2451,14 @@ impl App {
         };
         if is_server {
             if self.server(sid).map(|s| s.local || s.demo).unwrap_or(true) {
-                self.toast("not connected — use :connect <host>");
+                self.toast("not connected - use :connect <host>");
             } else {
                 self.send(sid, text);
             }
             return;
         }
-        let nick = self.nick_of(sid);
-        let chunks = util::irc_chunks(text, 420);
-        let mut delivered = true;
-        for chunk in &chunks {
-            if !self.send_silent(sid, format!("PRIVMSG {target} :{chunk}")) {
-                delivered = false;
-                break;
-            }
-            let mut message = Message::new(MsgKind::Privmsg, Some(&nick), chunk.as_str());
-            message.own = true;
-            self.push_msg(bid, message);
-        }
-        if !delivered {
-            self.toast("not connected — message not fully sent");
+        if !self.send_privmsg_to(sid, bid, &target, text) {
+            self.toast("not connected - message not fully sent");
         }
     }
 
@@ -2295,20 +2473,8 @@ impl App {
         if is_server {
             return;
         }
-        let nick = self.nick_of(sid);
-        let chunks = util::irc_chunks(text, 410);
-        let mut delivered = true;
-        for chunk in &chunks {
-            if !self.send_silent(sid, format!("PRIVMSG {target} :\u{1}ACTION {chunk}\u{1}")) {
-                delivered = false;
-                break;
-            }
-            let mut message = Message::new(MsgKind::Action, Some(&nick), chunk.as_str());
-            message.own = true;
-            self.push_msg(bid, message);
-        }
-        if !delivered {
-            self.toast("not connected — message not fully sent");
+        if !self.send_action_to(sid, bid, &target, text) {
+            self.toast("not connected - message not fully sent");
         }
     }
 
@@ -2458,34 +2624,58 @@ impl App {
             if let Some(channel) = self.channel_name(active) {
                 self.send(sid, format!("JOIN {channel}"));
             } else {
-                self.toast("usage: /join <#channel>");
+                self.toast("usage: /join <#channel> [,#channel] [keys]");
             }
             return;
         }
-        let channels: Vec<String> = rest
-            .split(|c: char| c == ',' || c.is_whitespace())
-            .filter(|c| !c.is_empty())
-            .map(|c| {
+        let mut tokens = rest.split_whitespace();
+        let channels_arg = tokens.next().unwrap_or("");
+        let keys_arg = tokens.next();
+        if tokens.next().is_some() {
+            self.toast("usage: /join #chan[,#chan] [key[,key]]");
+            return;
+        }
+        let default_prefix = self
+            .server(sid)
+            .and_then(|server| server.chantypes.first().copied())
+            .unwrap_or('#');
+        let channels: Vec<String> = channels_arg
+            .split(',')
+            .filter(|channel| !channel.is_empty())
+            .map(|channel| {
                 if self
                     .server(sid)
-                    .map(|s| s.is_channel_name(c))
-                    .unwrap_or_else(|| c.starts_with('#'))
+                    .map(|server| server.is_channel_name(channel))
+                    .unwrap_or_else(|| channel.starts_with('#'))
                 {
-                    c.to_string()
+                    channel.to_string()
                 } else {
-                    format!("#{c}")
+                    format!("{default_prefix}{channel}")
                 }
             })
             .collect();
         if channels.is_empty() {
             return;
         }
-        self.send(sid, format!("JOIN {}", channels.join(",")));
+        let keys = keys_arg
+            .map(|keys| {
+                keys.split(',')
+                    .filter(|key| !key.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .filter(|keys| !keys.is_empty());
+        let mut line = format!("JOIN {}", channels.join(","));
+        if let Some(keys) = keys.as_deref() {
+            line.push(' ');
+            line.push_str(keys);
+        }
+        self.send(sid, line);
         let mut last = None;
         for channel in &channels {
             let bid = self.ensure_channel(sid, channel);
             last = Some(bid);
-            self.push_system(bid, MsgKind::Info, format!("→ Joining {channel}…"));
+            self.push_system(bid, MsgKind::Info, format!("Joining {channel}…"));
         }
         if let Some(bid) = last {
             self.set_active(bid);
@@ -2531,24 +2721,39 @@ impl App {
 
     fn cmd_msg(&mut self, sid: usize, rest: &str) {
         let mut parts = rest.splitn(2, char::is_whitespace);
-        let nick = parts.next().unwrap_or("");
+        let target = parts.next().unwrap_or("");
         let text = parts.next().unwrap_or("").trim();
-        if nick.is_empty() {
-            self.toast("usage: /msg <nick> [text]");
+        if target.is_empty() {
+            self.toast("usage: /msg <nick|#channel> [text]");
             return;
         }
-        let bid = self.ensure_query(sid, nick);
-        self.set_active(bid);
-        if !text.is_empty() {
-            let my_nick = self.nick_of(sid);
-            let delivered = self.send_silent(sid, format!("PRIVMSG {nick} :{text}"));
-            if delivered {
-                let mut message = Message::new(MsgKind::Privmsg, Some(&my_nick), text);
-                message.own = true;
-                self.push_msg(bid, message);
-            } else {
-                self.toast("not connected — message not sent");
+        if target.contains(',') {
+            self.toast("multiple targets are not supported");
+            return;
+        }
+        let channel = self
+            .server(sid)
+            .and_then(|server| server.channel_target(target));
+        let bid = match channel {
+            Some((channel, Some(prefix))) => {
+                self.toast(format!(
+                    "status-targeted messages ({prefix}{channel}) are not supported"
+                ));
+                return;
             }
+            Some((channel, None)) => {
+                let bid = self.ensure_channel(sid, &channel);
+                self.set_active(bid);
+                bid
+            }
+            None => {
+                let bid = self.ensure_query(sid, target);
+                self.set_active(bid);
+                bid
+            }
+        };
+        if !text.is_empty() && !self.send_privmsg_to(sid, bid, target, text) {
+            self.toast("not connected - message not sent");
         }
     }
 
@@ -2611,6 +2816,17 @@ impl App {
         {
             let sid = existing.id;
             let connected = existing.connected;
+            let existing_tls = existing.tls;
+            if existing_tls != tls {
+                self.toast(format!(
+                    "{host}:{port} already exists with {}; disconnect it first",
+                    if existing_tls { "TLS" } else { "plaintext" }
+                ));
+                if let Some(bid) = self.server_buffer(sid) {
+                    self.set_active(bid);
+                }
+                return;
+            }
             if let Some(bid) = self.server_buffer(sid) {
                 self.set_active(bid);
             }
@@ -3600,24 +3816,53 @@ fn is_numeric(command: &str) -> bool {
     command.len() == 3 && command.chars().all(|c| c.is_ascii_digit())
 }
 
+fn validate_outgoing(line: &str) -> Result<(), &'static str> {
+    if line.len() > 510 {
+        return Err("outgoing IRC line exceeds 510 bytes");
+    }
+    if line
+        .bytes()
+        .any(|byte| byte == b'\r' || byte == b'\n' || byte == 0)
+    {
+        return Err("outgoing IRC line contains CR, LF, or NUL");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use std::sync::mpsc::channel;
+    use tokio::sync::mpsc::{channel, error::TryRecvError, Receiver};
 
     fn demo_app() -> (App, tokio::runtime::Runtime) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let (tx, _rx) = channel();
+        let (tx, _rx) = channel(64);
         let cfg = Config {
             demo: true,
             ..Default::default()
         };
         let app = App::new(cfg, Some(rt.handle().clone()), tx);
         (app, rt)
+    }
+
+    fn recv_timeout(rx: &mut Receiver<NetEvent>, timeout: Duration) -> Option<NetEvent> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match rx.try_recv() {
+                Ok(event) => return Some(event),
+                Err(TryRecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(TryRecvError::Disconnected) => return None,
+            }
+        }
     }
 
     fn press(app: &mut App, code: KeyCode) {
@@ -3632,6 +3877,21 @@ mod tests {
             token,
             line: raw.to_string(),
         });
+    }
+
+    fn capture(app: &mut App) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.servers[0].demo = false;
+        app.servers[0].tx = Some(tx);
+        rx
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            out.push(line);
+        }
+        out
     }
 
     #[test]
@@ -3730,6 +3990,182 @@ mod tests {
     }
 
     #[test]
+    fn keyed_join_keeps_keys_out_of_channels() {
+        let (mut app, _rt) = demo_app();
+        let sid = app.servers[0].id;
+        let mut rx = capture(&mut app);
+
+        app.run_command("join #books sample");
+        assert_eq!(rx.try_recv().unwrap(), "JOIN #books sample");
+        assert!(app.find_channel(sid, "#books").is_some());
+        assert!(app.find_channel(sid, "#sample").is_none());
+
+        app.run_command("join #a,#b key1,key2");
+        assert_eq!(rx.try_recv().unwrap(), "JOIN #a,#b key1,key2");
+        assert!(app.find_channel(sid, "#a").is_some());
+        assert!(app.find_channel(sid, "#b").is_some());
+    }
+
+    #[test]
+    fn channel_targets_are_not_private_queries() {
+        let (mut app, _rt) = demo_app();
+        let sid = app.servers[0].id;
+        let mut rx = capture(&mut app);
+
+        app.run_command("msg #books hello");
+        assert_eq!(rx.try_recv().unwrap(), "PRIVMSG #books :hello");
+        assert!(app.find_query(sid, "#books").is_none());
+        assert!(app
+            .active_buffer()
+            .map(|buffer| buffer.is_channel())
+            .unwrap_or(false));
+
+        line(&mut app, ":alice!u@h PRIVMSG @#rust :ops only");
+        assert!(app.find_query(sid, "@#rust").is_none());
+        let rust = app.find_channel(sid, "#rust").unwrap();
+        let last = app.buffers[rust].messages.last().unwrap();
+        assert!(last.text.contains("[@#rust] ops only"));
+
+        app.run_command("msg @#rust nope");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn malformed_prefix_metadata_is_ignored() {
+        let (mut app, _rt) = demo_app();
+        let before = app.servers[0].prefix_modes.clone();
+
+        line(&mut app, ":srv 005 tester PREFIX=)( :are supported");
+        assert_eq!(app.servers[0].prefix_modes, before);
+        line(&mut app, ":srv 005 tester PREFIX=(ov)@ :are supported");
+        assert_eq!(app.servers[0].prefix_modes, before);
+
+        line(
+            &mut app,
+            ":srv 005 tester PREFIX=(ov)@+ STATUSMSG=@+ :are supported",
+        );
+        assert_eq!(app.servers[0].prefix_modes, vec![('o', '@'), ('v', '+')]);
+        assert_eq!(app.servers[0].statusmsg, vec!['@', '+']);
+    }
+
+    #[test]
+    fn ctcp_version_only_replies_to_private_messages() {
+        let (mut app, _rt) = demo_app();
+        let mut rx = capture(&mut app);
+
+        line(&mut app, ":alice!u@h PRIVMSG vimmer :\u{1}VERSION\u{1}");
+        let reply = rx.try_recv().expect("version reply");
+        assert!(reply.starts_with("NOTICE alice :\u{1}VERSION rirc"));
+
+        line(&mut app, ":alice!u@h NOTICE vimmer :\u{1}VERSION\u{1}");
+        assert!(rx.try_recv().is_err());
+
+        // Rate limited even for a second private request.
+        line(&mut app, ":alice!u@h PRIVMSG vimmer :\u{1}VERSION\u{1}");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn outgoing_lines_are_validated_and_chunked_by_bytes() {
+        let (mut app, _rt) = demo_app();
+        let sid = app.servers[0].id;
+        let mut rx = capture(&mut app);
+
+        assert!(!app.send_silent(sid, "PRIVMSG #x :a\r\nQUIT"));
+        assert!(rx.try_recv().is_err());
+        assert!(!app.send_silent(sid, "X".repeat(511)));
+        assert!(rx.try_recv().is_err());
+        assert!(app.send_silent(sid, "PING :ok"));
+        assert_eq!(rx.try_recv().unwrap(), "PING :ok");
+
+        app.run_command(&format!("msg alice {}", "é".repeat(300)));
+        let sent = drain(&mut rx);
+        assert!(sent.len() >= 2);
+        assert!(sent.iter().all(|line| line.len() <= 510));
+        assert!(sent.iter().all(|line| line.starts_with("PRIVMSG alice :")));
+    }
+
+    #[test]
+    fn sasl_state_gates_credentials_and_autojoin() {
+        let (mut app, _rt) = demo_app();
+        let sid = app.servers[0].id;
+        let mut rx = capture(&mut app);
+        app.servers[0].tls = true;
+        app.servers[0].sasl = Some(("user".to_string(), "pass".to_string()));
+        app.servers[0].autojoins = vec!["#auto".to_string()];
+
+        app.begin_registration(sid);
+        let initial = drain(&mut rx);
+        assert!(initial.iter().any(|line| line == "CAP LS 302"));
+        assert!(!initial.iter().any(|line| line.starts_with("AUTHENTICATE")));
+
+        // No unsolicited response before the server has acknowledged SASL.
+        line(&mut app, "AUTHENTICATE +");
+        assert!(rx.try_recv().is_err());
+
+        line(
+            &mut app,
+            ":srv CAP tester LS :sasl=PLAIN message-tags account-notify",
+        );
+        let request = drain(&mut rx);
+        assert!(request
+            .iter()
+            .any(|line| line.starts_with("CAP REQ") && line.contains("sasl")));
+
+        line(
+            &mut app,
+            ":srv CAP tester ACK :message-tags account-notify sasl",
+        );
+        assert_eq!(rx.try_recv().unwrap(), "AUTHENTICATE PLAIN");
+
+        line(&mut app, "AUTHENTICATE +");
+        assert!(rx.try_recv().unwrap().starts_with("AUTHENTICATE "));
+
+        line(&mut app, ":srv 903 tester :SASL success");
+        let after_sasl = drain(&mut rx);
+        assert!(after_sasl.iter().any(|line| line == "CAP END"));
+
+        line(&mut app, ":srv 001 tester :Welcome");
+        let after_welcome = drain(&mut rx);
+        assert!(after_welcome.iter().any(|line| line == "JOIN #auto"));
+
+        // A configured SASL failure must not autojoin as a guest.
+        let (mut app, _rt) = demo_app();
+        let sid = app.servers[0].id;
+        let mut rx = capture(&mut app);
+        app.servers[0].tls = true;
+        app.servers[0].sasl = Some(("user".to_string(), "pass".to_string()));
+        app.servers[0].autojoins = vec!["#auto".to_string()];
+        app.begin_registration(sid);
+        drain(&mut rx);
+        line(&mut app, ":srv 001 tester :Welcome");
+        assert!(drain(&mut rx).iter().all(|line| line != "JOIN #auto"));
+        let console = app.server_buffer(sid).unwrap();
+        assert!(app.buffers[console]
+            .messages
+            .iter()
+            .any(|message| message.text.contains("SASL did not complete")));
+    }
+
+    #[test]
+    fn tls_change_is_not_silently_reused() {
+        let (mut app, _rt) = demo_app();
+        app.servers[0].host = "example.org".to_string();
+        app.servers[0].port = 6697;
+        app.servers[0].tls = false;
+        app.servers[0].connected = true;
+        let before = app.servers.len();
+
+        app.run_command("connect example.org 6697 tls");
+        assert_eq!(app.servers.len(), before);
+        assert!(app
+            .toast
+            .as_ref()
+            .map(|(text, _)| text.contains("plaintext"))
+            .unwrap_or(false));
+    }
+
+    #[test]
     fn list_browser_opens_in_demo_mode() {
         let (mut app, _rt) = demo_app();
         app.run_command("list");
@@ -3809,7 +4245,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (tx, rx) = channel();
+        let (tx, mut rx) = channel(64);
         let mut app = App::new(Config::default(), Some(rt.handle().clone()), tx);
         app.start_server(ServerConfig {
             host: "127.0.0.1".to_string(),
@@ -3824,15 +4260,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut connected = false;
         while Instant::now() < deadline && !connected {
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(event) => {
-                    if matches!(event, NetEvent::Connected { .. }) {
-                        connected = true;
-                    }
-                    app.on_net(event);
+            if let Some(event) = recv_timeout(&mut rx, Duration::from_millis(200)) {
+                if matches!(event, NetEvent::Connected { .. }) {
+                    connected = true;
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(_) => break,
+                app.on_net(event);
             }
         }
         assert!(connected, "did not connect to the mock server");
@@ -3846,10 +4278,8 @@ mod tests {
             if finished {
                 break;
             }
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(event) => app.on_net(event),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(_) => break,
+            if let Some(event) = recv_timeout(&mut rx, Duration::from_millis(200)) {
+                app.on_net(event);
             }
         }
 
@@ -3906,7 +4336,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (tx, rx) = channel();
+        let (tx, mut rx) = channel(64);
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -3931,10 +4361,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             let left = deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(left.min(Duration::from_millis(500))) {
-                Ok(event) => app.on_net(event),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(_) => break,
+            if let Some(event) = recv_timeout(&mut rx, left.min(Duration::from_millis(500))) {
+                app.on_net(event);
             }
             if app
                 .servers

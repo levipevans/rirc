@@ -86,7 +86,7 @@ fn channels_from(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
-        .filter(|c| !c.is_empty())
+        .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
         .map(|c| {
             if c.starts_with('#') || c.starts_with('&') || c.starts_with('+') || c.starts_with('!')
             {
@@ -201,6 +201,23 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
             .or(spec_port)
             .unwrap_or(if want_tls { 6697 } else { 6667 });
         let tls = tls.unwrap_or(port != 6667);
+        if !tls && (sasl.is_some() || pass.is_some()) {
+            return Err(
+                "refusing to send credentials over a plaintext connection; use --tls".to_string(),
+            );
+        }
+        if pass
+            .as_deref()
+            .map(|value| value.chars().any(char::is_control))
+            .unwrap_or(false)
+        {
+            return Err("--pass contains control characters".to_string());
+        }
+        if let Some((user, secret)) = &sasl {
+            if user.chars().any(char::is_control) || secret.chars().any(char::is_control) {
+                return Err("--sasl contains control characters".to_string());
+            }
+        }
         config.start = Some(ServerConfig {
             host,
             port,
@@ -212,6 +229,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
         });
     } else if !channels.is_empty() {
         return Err("--channel needs --server".to_string());
+    } else if sasl.is_some() || pass.is_some() {
+        return Err("--sasl and --pass need --server".to_string());
     }
 
     Ok(config)
@@ -262,5 +281,21 @@ mod tests {
     fn sanitizes_nick() {
         let cfg = parse_args(args(&["--nick", "9weird nick!"])).unwrap();
         assert_eq!(cfg.nick, "weirdnick");
+    }
+
+    #[test]
+    fn refuses_credentials_without_tls() {
+        assert!(parse_args(args(
+            &["-s", "example.org", "--no-tls", "--pass", "secret",]
+        ))
+        .is_err());
+        assert!(parse_args(args(&["-s", "example.org:6667", "--sasl", "user:secret",])).is_err());
+        assert!(parse_args(args(&["--pass", "secret"])).is_err());
+    }
+
+    #[test]
+    fn allows_credentials_with_tls() {
+        let cfg = parse_args(args(&["-s", "example.org", "--pass", "secret"])).unwrap();
+        assert!(cfg.start.unwrap().tls);
     }
 }

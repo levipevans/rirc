@@ -55,7 +55,9 @@ impl ChannelList {
 
     pub fn add(&mut self, entry: ListEntry) {
         self.entries.push(entry);
-        self.normalize_selection();
+        if self.selected >= self.entries.len() {
+            self.selected = 0;
+        }
     }
 
     pub fn finish(&mut self) {
@@ -94,6 +96,14 @@ impl ChannelList {
     }
 
     pub fn normalize_selection(&mut self) {
+        if self.filter.trim().is_empty() {
+            if self.entries.is_empty() {
+                self.selected = 0;
+            } else {
+                self.selected = self.selected.min(self.entries.len() - 1);
+            }
+            return;
+        }
         let filtered = self.filtered();
         if filtered.is_empty() {
             self.selected = 0;

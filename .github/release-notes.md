@@ -1,35 +1,35 @@
-# rirc v0.1.0
+# rirc v0.1.1
 
-The first public release of **rirc** — a tiny, vim-flavoured IRCv3 client for
-the terminal.
+Security and robustness hardening for the v0.1.0 release.
 
 ## Downloads
 
-- **Windows x86_64** — `rirc-v0.1.0-x86_64-pc-windows-msvc.zip`
-- **macOS universal** (Apple Silicon + Intel) — `rirc-v0.1.0-macos-universal.tar.gz`
-- **Linux x86_64** (static musl, portable across distributions) — `rirc-v0.1.0-x86_64-unknown-linux-musl.tar.gz`
+- **Windows x86_64** — `rirc-v0.1.1-x86_64-pc-windows-msvc.zip`
+- **macOS universal** (Apple Silicon + Intel) — `rirc-v0.1.1-macos-universal.tar.gz`
+- **Linux x86_64** (static musl, portable across distributions) — `rirc-v0.1.1-x86_64-unknown-linux-musl.tar.gz`
 - `SHA256SUMS.txt` for verification
 
-Extract the archive, put `rirc` somewhere on your `PATH`, and run:
+## Fixes
 
-```sh
-rirc --demo
-# or
-rirc -s irc.libera.chat -n yournick -c '#rust,#vim'
-```
-
-## Highlights
-
-- Three-column TUI: buffers/servers, messages, and channel members.
-- Modal editing: `NORMAL`, `VISUAL`, `TEXT`, and `COMMAND` modes.
-- Context menus for servers, channels, members, and individual messages.
-- Select one or many messages in visual mode and yank them to the clipboard.
-- Filterable `/list` channel browser with join, copy, and refresh actions.
-- IRCv3: CAP LS 302, message tags, server-time, multi-prefix, away-notify,
-  extended-join, account-tag, SASL PLAIN, and TLS.
-- Multiple servers, unread/mention badges, WHOIS popups, nick completion, and
-  mouse support.
-- Clipboard via native helpers and OSC 52 (works over SSH and tmux).
+- `/join #channel key` now preserves the IRC channels/keys split; keys no
+  longer become channel names or extra buffers.
+- `/msg` and `/query` classify channels properly instead of creating a
+  “private conversation” for a group target. STATUSMSG targets are labeled and
+  never silently widened.
+- `PASS` and SASL credentials require TLS. `/connect` refuses to reuse an
+  existing connection with different TLS settings.
+- SASL has an explicit negotiation state machine; unsolicited challenges are
+  ignored, and channels are not auto-joined if configured authentication did
+  not complete.
+- Malformed `PREFIX` metadata can no longer panic the client.
+- CTCP VERSION replies only answer private PRIVMSG requests, with rate limiting.
+- Inbound framing is byte-bounded and cancellation-safe; invalid UTF-8 is
+  decoded lossily instead of dropping the connection. Event processing is
+  bounded so a flooding server cannot starve the UI.
+- `/list` ingestion no longer rebuilds its filter index for every row.
+- Outgoing lines reject CR/LF/NUL and are chunked by UTF-8 byte length, not
+  character count.
+- Buffer, member and event-state growth is bounded.
 
 ## Notes
 

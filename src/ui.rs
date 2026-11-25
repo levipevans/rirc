@@ -1284,7 +1284,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::model::BufferKind;
-    use std::sync::mpsc::channel;
+    use tokio::sync::mpsc::channel;
 
     #[test]
     fn demo_renders_at_many_sizes() {
@@ -1292,7 +1292,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (tx, _rx) = channel();
+        let (tx, _rx) = channel(64);
         let cfg = Config {
             demo: true,
             ..Default::default()
@@ -1364,7 +1364,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (tx, _rx) = channel();
+        let (tx, _rx) = channel(64);
         let cfg = Config {
             demo: true,
             ..Default::default()
@@ -1404,7 +1404,7 @@ mod tests {
 
     #[test]
     fn welcome_screen_renders_without_a_server() {
-        let (tx, _rx) = channel();
+        let (tx, _rx) = channel(64);
         let cfg = Config::default();
         let mut app = App::new(cfg, None, tx);
         let screen = render_to_string(&mut app, 100, 30);
@@ -1422,7 +1422,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (tx, _rx) = channel();
+        let (tx, _rx) = channel(64);
         let cfg = Config {
             demo: true,
             ..Default::default()
