@@ -1,6 +1,6 @@
 [package]
 name = "rirc"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "A tiny, vim-flavoured IRCv3 client for the terminal"
 license = "MIT"
@@ -12,6 +12,8 @@ ratatui = "0.29.0"
 crossterm = "0.28.1"
 chrono = "0.4"
 base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 tokio-native-tls = "0.3"
 unicode-width = "0.2"

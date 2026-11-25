@@ -1,35 +1,43 @@
-# rirc v0.1.1
+# rirc v0.2.0
 
-Security and robustness hardening for the v0.1.0 release.
+rirc now has **Python plugins**.
 
 ## Downloads
 
-- **Windows x86_64** — `rirc-v0.1.1-x86_64-pc-windows-msvc.zip`
-- **macOS universal** (Apple Silicon + Intel) — `rirc-v0.1.1-macos-universal.tar.gz`
-- **Linux x86_64** (static musl, portable across distributions) — `rirc-v0.1.1-x86_64-unknown-linux-musl.tar.gz`
+- **Windows x86_64** — `rirc-v0.2.0-x86_64-pc-windows-msvc.zip`
+- **macOS universal** (Apple Silicon + Intel) — `rirc-v0.2.0-macos-universal.tar.gz`
+- **Linux x86_64** (static musl, portable across distributions) — `rirc-v0.2.0-x86_64-unknown-linux-musl.tar.gz`
 - `SHA256SUMS.txt` for verification
 
-## Fixes
+## Plugins
 
-- `/join #channel key` now preserves the IRC channels/keys split; keys no
-  longer become channel names or extra buffers.
-- `/msg` and `/query` classify channels properly instead of creating a
-  “private conversation” for a group target. STATUSMSG targets are labeled and
-  never silently widened.
-- `PASS` and SASL credentials require TLS. `/connect` refuses to reuse an
-  existing connection with different TLS settings.
-- SASL has an explicit negotiation state machine; unsolicited challenges are
-  ignored, and channels are not auto-joined if configured authentication did
-  not complete.
-- Malformed `PREFIX` metadata can no longer panic the client.
-- CTCP VERSION replies only answer private PRIVMSG requests, with rate limiting.
-- Inbound framing is byte-bounded and cancellation-safe; invalid UTF-8 is
-  decoded lossily instead of dropping the connection. Event processing is
-  bounded so a flooding server cannot starve the UI.
-- `/list` ingestion no longer rebuilds its filter index for every row.
-- Outgoing lines reject CR/LF/NUL and are chunked by UTF-8 byte length, not
-  character count.
-- Buffer, member and event-state growth is bounded.
+- Drop a `.py` file into a `plugins/` folder and run `/plugins reload`.
+- Plugins register slash commands, receive message/join/part/quit/topic/mode
+  hooks, read recent state and history, send messages, join/part channels,
+  copy to the clipboard, show notifications, schedule timers, and keep
+  persistent per-plugin data.
+- The plugin host is a separate Python process, so a buggy plugin cannot take
+  down the TUI. Plugins are trusted code and are not sandboxed.
+- `/plugins` shows host status, Python version, directories, loaded plugins,
+  commands, and recent logs. `/plugins logs` shows the log; `/plugins reload`
+  restarts the host.
+- Plugin commands appear in tab completion.
+- Examples are included in each archive under `plugins/`:
+  - `hello.py` — minimal command, event hook and reply
+  - `seen.py` — persistent `/seen <nick>` tracking
+  - `reminders.py` — `/remind 10m …` using API timers
+- Full author documentation: `docs/PLUGINS.md`.
+
+Python 3.9+ is recommended. If Python is not installed, rirc still runs
+normally and `/plugins` explains that the host is unavailable. Set
+`RIRC_PYTHON` to choose a specific interpreter, `RIRC_PLUGIN_DIR` or
+`--plugin-dir` to add plugin folders, or `--no-plugins` to disable plugins.
+
+## Also included
+
+All v0.1.1 security and robustness hardening is included: TLS-only credentials,
+keyed `/join` handling, correct channel/private targeting, SASL state gating,
+bounded framing and queues, byte-aware message chunking, and more.
 
 ## Notes
 

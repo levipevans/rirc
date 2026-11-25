@@ -46,6 +46,8 @@ pub enum MenuAction {
     },
     Reconnect(usize),
     Disconnect(usize),
+    PluginReload,
+    PluginLogs,
     Quit,
     Help,
     CloseMenu,
@@ -67,6 +69,8 @@ impl MenuAction {
             MenuAction::Kick { nick, .. } => format!("Kick {nick}"),
             MenuAction::Reconnect(_) => "Reconnect".to_string(),
             MenuAction::Disconnect(_) => "Disconnect".to_string(),
+            MenuAction::PluginReload => "Reload plugins".to_string(),
+            MenuAction::PluginLogs => "Plugin logs".to_string(),
             MenuAction::Quit => "Quit rirc".to_string(),
             MenuAction::Help => "Keyboard help".to_string(),
             MenuAction::CloseMenu => "Close menu".to_string(),
@@ -105,12 +109,13 @@ NORMAL     j/k move · Tab panel · Enter menu · l open · g/G ends
 VISUAL     j/k extend · o swap ends · y yank · Enter menu
 TEXT       Enter send · Tab complete nick · ↑/↓ history · Esc normal
 LIST       /list · j/k move · Enter menu · l join · f filter · r refresh
+PLUGINS    drop .py in plugins/ · /plugins · /plugins reload · /plugins logs
 PANELS     Tab cycles messages → buffers → members; click works too
 MOUSE      click a buffer/member/message · wheel moves the focused list
 CLIPBOARD  yanks go to the system clipboard and OSC 52
 COMMANDS   /join /part /me /msg /nick /topic /mode /whois /away /list
            /invite /kick /op /deop /voice /devoice /clear /close
-           /reconnect /disconnect /raw /help
+           /reconnect /disconnect /raw /help /plugins
 TIPS       Enter on a channel, member or message opens its menu.
            Select several messages with v then y to copy the block.";
 

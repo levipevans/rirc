@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use chrono::Local;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use serde_json::{json, Value};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::Sender;
 
@@ -16,6 +17,7 @@ use crate::list::{ChannelList, ListEntry};
 use crate::menu::{help_menu, Menu, MenuAction};
 use crate::model::*;
 use crate::modes::{insert, normal, visual};
+use crate::plugins::{PluginEvent, PluginManager};
 use crate::util;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +88,10 @@ pub struct App {
     pub width: u16,
     pub height: u16,
     pub hit: Hit,
+    pub plugins: PluginManager,
+    pub plugin_dirty: bool,
+    pub plugin_force_state: bool,
+    pub plugin_last_state: Instant,
     pub default_nick: String,
 }
 
@@ -114,6 +120,7 @@ const COMMANDS: &[&str] = &[
     "reconnect",
     "raw",
     "quote",
+    "plugins",
     "help",
     "quit",
     "q",
@@ -124,6 +131,7 @@ impl App {
     pub fn new(cfg: Config, rt: Option<Handle>, net_tx: Sender<NetEvent>) -> Self {
         let nick = cfg.nick.clone();
         let demo = cfg.demo;
+        let plugins = PluginManager::new(cfg.plugins_enabled, &cfg.plugin_dirs);
         let mut app = App {
             cfg,
             servers: Vec::new(),
@@ -146,6 +154,10 @@ impl App {
             width: 120,
             height: 40,
             hit: Hit::default(),
+            plugins,
+            plugin_dirty: true,
+            plugin_force_state: false,
+            plugin_last_state: Instant::now(),
             default_nick: nick,
         };
         if demo {
@@ -264,6 +276,7 @@ impl App {
     }
 
     pub fn create_buffer(&mut self, server: usize, kind: BufferKind) -> usize {
+        self.plugin_dirty = true;
         let id = self.next_buffer;
         self.next_buffer += 1;
         self.buffers.push(Buffer::new(id, server, kind));
@@ -460,6 +473,8 @@ impl App {
         if idx >= self.buffers.len() {
             return;
         }
+        self.plugin_dirty = true;
+        self.plugin_force_state = true;
         if self.active == Some(idx) {
             if let Some(buffer) = self.buffers.get_mut(idx) {
                 buffer.unread = 0;
@@ -527,6 +542,7 @@ impl App {
     }
 
     pub fn push_msg(&mut self, bid: usize, mut msg: Message) {
+        self.plugin_dirty = true;
         let active = self.active == Some(bid);
         let sid = match self.buffers.get(bid) {
             Some(b) => b.server,
@@ -582,6 +598,400 @@ impl App {
         if let Some((_, until)) = &self.toast {
             if Instant::now() >= *until {
                 self.toast = None;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------- plugins ---
+
+    pub fn poll_plugins(&mut self) {
+        for event in self.plugins.poll() {
+            match event {
+                PluginEvent::Ready => {
+                    self.plugin_force_state = true;
+                }
+                PluginEvent::Action {
+                    plugin,
+                    action,
+                    data,
+                } => self.apply_plugin_action(&plugin, &action, &data),
+                PluginEvent::Notify { text, level } => {
+                    let prefix = if level.eq_ignore_ascii_case("error") {
+                        "plugin error: "
+                    } else if level.eq_ignore_ascii_case("warn") {
+                        "plugin: "
+                    } else {
+                        ""
+                    };
+                    self.toast(format!("{prefix}{text}"));
+                }
+                PluginEvent::Exited(reason) => {
+                    self.toast(format!("plugin host stopped: {reason}"));
+                }
+            }
+        }
+
+        let now = Instant::now();
+        if self.plugins.is_ready()
+            && (self.plugin_force_state
+                || (self.plugin_dirty
+                    && now.duration_since(self.plugin_last_state) >= Duration::from_secs(2)))
+        {
+            let state = self.plugin_state();
+            self.plugins.send_state(state);
+            self.plugin_dirty = false;
+            self.plugin_force_state = false;
+            self.plugin_last_state = now;
+        }
+    }
+
+    fn plugin_event(&mut self, event: &str, data: Value) {
+        self.plugin_dirty = true;
+        self.plugins.send_event(event, data);
+    }
+
+    fn plugin_context(&self) -> Value {
+        let Some(bid) = self.active else {
+            return json!({});
+        };
+        let Some(buffer) = self.buffers.get(bid) else {
+            return json!({});
+        };
+        let sid = buffer.server;
+        let server = self.server(sid);
+        let (kind, is_channel, reply_target) = match &buffer.kind {
+            BufferKind::Server { .. } => ("server", false, Value::Null),
+            BufferKind::Channel { .. } => ("channel", true, json!(buffer.name())),
+            BufferKind::Query { .. } => ("query", false, json!(buffer.name())),
+        };
+        json!({
+            "server": sid,
+            "server_name": server.map(|entry| entry.display().to_string()).unwrap_or_default(),
+            "buffer": buffer.name(),
+            "target": buffer.name(),
+            "reply_target": reply_target,
+            "kind": kind,
+            "is_channel": is_channel,
+            "nick": self.nick_of(sid),
+            "topic": buffer.topic().unwrap_or(""),
+            "joined": matches!(&buffer.kind, BufferKind::Channel { joined: true, .. }),
+        })
+    }
+
+    fn plugin_state(&self) -> Value {
+        let servers: Vec<Value> = self
+            .servers
+            .iter()
+            .map(|server| {
+                json!({
+                    "id": server.id,
+                    "host": server.host,
+                    "port": server.port,
+                    "tls": server.tls,
+                    "network": server.network,
+                    "name": server.display(),
+                    "nick": server.nick,
+                    "connected": server.connected,
+                    "registered": server.registered,
+                    "local": server.local,
+                    "demo": server.demo,
+                })
+            })
+            .collect();
+        let buffers: Vec<Value> = self
+            .buffers
+            .iter()
+            .map(|buffer| {
+                let (kind, joined) = match &buffer.kind {
+                    BufferKind::Server { .. } => ("server", true),
+                    BufferKind::Channel { joined, .. } => ("channel", *joined),
+                    BufferKind::Query { .. } => ("query", true),
+                };
+                json!({
+                    "id": buffer.id,
+                    "server": buffer.server,
+                    "name": buffer.name(),
+                    "kind": kind,
+                    "topic": buffer.topic().unwrap_or(""),
+                    "unread": buffer.unread,
+                    "mentions": buffer.mentions,
+                    "joined": joined,
+                })
+            })
+            .collect();
+        let active = self
+            .active_buffer()
+            .map(|buffer| {
+                let sid = buffer.server;
+                let (kind, is_channel, reply_target) = match &buffer.kind {
+                    BufferKind::Server { .. } => ("server", false, Value::Null),
+                    BufferKind::Channel { .. } => ("channel", true, json!(buffer.name())),
+                    BufferKind::Query { .. } => ("query", false, json!(buffer.name())),
+                };
+                json!({
+                    "server": sid,
+                    "server_name": self.server(sid).map(|entry| entry.display().to_string()).unwrap_or_default(),
+                    "buffer": buffer.name(),
+                    "target": buffer.name(),
+                    "reply_target": reply_target,
+                    "kind": kind,
+                    "is_channel": is_channel,
+                    "nick": self.nick_of(sid),
+                    "topic": buffer.topic().unwrap_or(""),
+                    "joined": matches!(&buffer.kind, BufferKind::Channel { joined: true, .. }),
+                })
+            })
+            .unwrap_or(Value::Null);
+
+        let users: Vec<Value> = if let Some(bid) = self.active {
+            if let Some(buffer) = self.buffers.get(bid) {
+                if buffer.is_channel() {
+                    self.member_order(bid)
+                        .into_iter()
+                        .take(2000)
+                        .filter_map(|index| buffer.members().get(index).map(|member| (index, member)))
+                        .map(|(_, member)| {
+                            json!({
+                                "nick": member.nick,
+                                "prefixes": member.prefixes,
+                                "away": member.away,
+                                "account": member.account,
+                                "realname": member.realname,
+                                "self": util::fold(&member.nick) == util::fold(&self.nick_of(buffer.server)),
+                            })
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let messages: Vec<Value> = if let Some(buffer) = self.active_buffer() {
+            let start = buffer.messages.len().saturating_sub(100);
+            let is_channel = buffer.is_channel();
+            buffer.messages[start..]
+                .iter()
+                .map(|message| {
+                    json!({
+                        "buffer": buffer.name(),
+                        "target": buffer.name(),
+                        "nick": message.nick,
+                        "text": message.text,
+                        "kind": message.kind.label(),
+                        "highlight": message.highlight,
+                        "own": message.own,
+                        "timestamp": message.ts.timestamp(),
+                        "is_channel": is_channel,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "servers": servers,
+            "buffers": buffers,
+            "active": active,
+            "users": users,
+            "messages": messages,
+        })
+    }
+
+    fn apply_plugin_action(&mut self, plugin: &str, action: &str, data: &Value) {
+        let text = data.get("text").and_then(Value::as_str).unwrap_or("");
+        let target = data.get("target").and_then(Value::as_str).unwrap_or("");
+        let sid = data
+            .get("server")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .or_else(|| self.active_buffer().map(|buffer| buffer.server));
+        let Some(sid) = sid else {
+            self.plugins
+                .log_line(format!("[{plugin}] {action}: no active server"));
+            return;
+        };
+        match action {
+            "send_message" => {
+                self.plugin_send_message(plugin, sid, target, text);
+            }
+            "notice" => {
+                self.plugin_notice(plugin, sid, target, text);
+            }
+            "me" => {
+                self.plugin_me(plugin, sid, target, text);
+            }
+            "send_raw" => {
+                if let Some(line) = data.get("line").and_then(Value::as_str) {
+                    self.send(sid, line);
+                }
+            }
+            "join" => {
+                if let Some(channel) = data.get("channel").and_then(Value::as_str) {
+                    let key = data.get("key").and_then(Value::as_str).unwrap_or("");
+                    self.plugin_join(plugin, sid, channel, key);
+                }
+            }
+            "part" => {
+                if let Some(channel) = data.get("channel").and_then(Value::as_str) {
+                    let reason = data.get("reason").and_then(Value::as_str).unwrap_or("");
+                    let bid = self.find_channel(sid, channel);
+                    if let Some(bid) = bid {
+                        if reason.is_empty() {
+                            self.send(sid, format!("PART {channel}"));
+                        } else {
+                            self.send(sid, format!("PART {channel} :{reason}"));
+                        }
+                        if let BufferKind::Channel { joined, .. } = &mut self.buffers[bid].kind {
+                            *joined = false;
+                        }
+                    }
+                }
+            }
+            "set_topic" => {
+                if let Some(channel) = data.get("channel").and_then(Value::as_str) {
+                    self.send(sid, format!("TOPIC {channel} :{text}"));
+                }
+            }
+            "whois" => {
+                if let Some(nick) = data.get("nick").and_then(Value::as_str) {
+                    if let Some(server) = self.server_mut(sid) {
+                        server.whois = Some(Whois::new(nick));
+                    }
+                    self.send(sid, format!("WHOIS {nick}"));
+                }
+            }
+            "activate" => {
+                if !target.is_empty() {
+                    self.plugin_activate(sid, target);
+                }
+            }
+            "copy" => {
+                if let Some(text) = data.get("text").and_then(Value::as_str) {
+                    self.copy(text.to_string(), "plugin text");
+                }
+            }
+            other => {
+                self.plugins
+                    .log_line(format!("[{plugin}] unknown action: {other}"));
+            }
+        }
+    }
+
+    fn plugin_send_message(&mut self, plugin: &str, sid: usize, target: &str, text: &str) {
+        if target.is_empty() || target.contains(',') {
+            self.plugins.log_line(format!(
+                "[{plugin}] send_message: invalid target {target:?}"
+            ));
+            return;
+        }
+        let channel = self
+            .server(sid)
+            .and_then(|server| server.channel_target(target));
+        let bid = match channel {
+            Some((channel, _)) => self.ensure_channel(sid, &channel),
+            None => self.ensure_query(sid, target),
+        };
+        if !self.send_privmsg_to(sid, bid, target, text) {
+            self.plugins
+                .log_line(format!("[{plugin}] send_message to {target} failed"));
+        }
+    }
+
+    fn plugin_notice(&mut self, plugin: &str, sid: usize, target: &str, text: &str) {
+        if target.is_empty() || target.contains(',') {
+            self.plugins
+                .log_line(format!("[{plugin}] notice: invalid target {target:?}"));
+            return;
+        }
+        let channel = self
+            .server(sid)
+            .and_then(|server| server.channel_target(target));
+        let bid = match channel {
+            Some((channel, _)) => self.ensure_channel(sid, &channel),
+            None => self.ensure_query(sid, target),
+        };
+        if !self.send_silent(sid, format!("NOTICE {target} :{text}")) {
+            self.plugins
+                .log_line(format!("[{plugin}] notice to {target} failed"));
+            return;
+        }
+        let nick = self.nick_of(sid);
+        let mut message = Message::new(MsgKind::Notice, Some(&nick), text);
+        message.own = true;
+        self.push_msg(bid, message);
+    }
+
+    fn plugin_me(&mut self, plugin: &str, sid: usize, target: &str, text: &str) {
+        if target.is_empty() || target.contains(',') {
+            self.plugins
+                .log_line(format!("[{plugin}] me: invalid target {target:?}"));
+            return;
+        }
+        let channel = self
+            .server(sid)
+            .and_then(|server| server.channel_target(target));
+        let bid = match channel {
+            Some((channel, _)) => self.ensure_channel(sid, &channel),
+            None => self.ensure_query(sid, target),
+        };
+        if !self.send_action_to(sid, bid, target, text) {
+            self.plugins
+                .log_line(format!("[{plugin}] me to {target} failed"));
+        }
+    }
+
+    fn plugin_join(&mut self, plugin: &str, sid: usize, channel: &str, key: &str) {
+        if channel.is_empty() || channel.contains(',') {
+            self.plugins
+                .log_line(format!("[{plugin}] join: invalid channel {channel:?}"));
+            return;
+        }
+        let prefix = self
+            .server(sid)
+            .and_then(|server| server.chantypes.first().copied())
+            .unwrap_or('#');
+        let channel = if self
+            .server(sid)
+            .map(|server| server.is_channel_name(channel))
+            .unwrap_or_else(|| channel.starts_with('#'))
+        {
+            channel.to_string()
+        } else {
+            format!("{prefix}{channel}")
+        };
+        let line = if key.is_empty() {
+            format!("JOIN {channel}")
+        } else {
+            format!("JOIN {channel} {key}")
+        };
+        let bid = self.ensure_channel(sid, &channel);
+        self.push_system(bid, MsgKind::Info, format!("Joining {channel}…"));
+        self.send(sid, line);
+    }
+
+    fn plugin_activate(&mut self, sid: usize, target: &str) {
+        if let Some((channel, _)) = self
+            .server(sid)
+            .and_then(|server| server.channel_target(target))
+        {
+            let bid = self.ensure_channel(sid, &channel);
+            self.set_active(bid);
+            return;
+        }
+        if let Some(bid) = self.find_query(sid, target) {
+            self.set_active(bid);
+        } else if let Some(server) = self.server(sid) {
+            if util::fold(server.display()) == util::fold(target) {
+                if let Some(bid) = self.server_buffer(sid) {
+                    self.set_active(bid);
+                }
             }
         }
     }
@@ -652,6 +1062,19 @@ impl App {
                         list.fail(&message);
                     }
                 }
+                let server_name = self
+                    .server(server)
+                    .map(|entry| entry.display().to_string())
+                    .unwrap_or_default();
+                self.plugin_event(
+                    "disconnected",
+                    json!({
+                        "server": server,
+                        "server_name": server_name,
+                        "reason": message.clone(),
+                        "error": true,
+                    }),
+                );
                 self.server_msg(
                     server,
                     MsgKind::Error,
@@ -691,6 +1114,19 @@ impl App {
                     }
                 }
                 if reason != "client closed" {
+                    let server_name = self
+                        .server(server)
+                        .map(|entry| entry.display().to_string())
+                        .unwrap_or_default();
+                    self.plugin_event(
+                        "disconnected",
+                        json!({
+                            "server": server,
+                            "server_name": server_name,
+                            "reason": reason,
+                            "error": false,
+                        }),
+                    );
                     let text = if was {
                         format!("Disconnected: {reason}")
                     } else {
@@ -887,6 +1323,15 @@ impl App {
     // -------------------------------------------------------------- wire ---
 
     fn handle_line(&mut self, sid: usize, line: &str) {
+        self.plugin_event(
+            "raw",
+            json!({
+                "server": sid,
+                "server_name": self.server(sid).map(|server| server.display().to_string()).unwrap_or_default(),
+                "line": line,
+                "direction": "in",
+            }),
+        );
         let Some(msg) = irc::parse(line) else { return };
         match msg.command.as_str() {
             "PING" => {
@@ -998,6 +1443,20 @@ impl App {
                 *title = label;
             }
         }
+        let server_name = self
+            .server(sid)
+            .map(|server| server.display().to_string())
+            .unwrap_or_default();
+        self.plugin_event(
+            "connected",
+            json!({
+                "server": sid,
+                "server_name": server_name,
+                "nick": nick,
+                "sasl_required": sasl_required,
+                "authenticated": authenticated,
+            }),
+        );
         if sasl_required && !authenticated {
             self.server_msg(
                 sid,
@@ -1117,6 +1576,38 @@ impl App {
         let mut message = Message::new(kind, Some(&nick), text).at(ts);
         message.own = own;
         self.push_msg(bid, message);
+
+        let server_name = self
+            .server(sid)
+            .map(|server| server.display().to_string())
+            .unwrap_or_default();
+        let event = {
+            let Some(buffer) = self.buffers.get(bid) else {
+                return;
+            };
+            let Some(message) = buffer.messages.last() else {
+                return;
+            };
+            let buffer_name = buffer.name().to_string();
+            let is_channel = buffer.is_channel();
+            let is_private = matches!(&buffer.kind, BufferKind::Query { .. });
+            json!({
+                "server": sid,
+                "server_name": server_name,
+                "buffer": buffer_name,
+                "target": target,
+                "reply_target": if is_private { json!(nick) } else if is_channel { json!(buffer_name) } else { Value::Null },
+                "nick": message.nick.clone(),
+                "text": message.text.clone(),
+                "kind": message.kind.label(),
+                "highlight": message.highlight,
+                "own": message.own,
+                "timestamp": message.ts.timestamp(),
+                "is_channel": is_channel,
+                "private": is_private,
+            })
+        };
+        self.plugin_event("message", event);
     }
 
     fn on_join(&mut self, sid: usize, msg: &IrcMessage) {
@@ -1148,6 +1639,25 @@ impl App {
         } else {
             self.push_system(bid, MsgKind::Join, format!("→ {nick} joined"));
         }
+        let server_name = self
+            .server(sid)
+            .map(|server| server.display().to_string())
+            .unwrap_or_default();
+        self.plugin_event(
+            "join",
+            json!({
+                "server": sid,
+                "server_name": server_name,
+                "channel": channel,
+                "buffer": channel,
+                "target": channel,
+                "reply_target": channel,
+                "nick": nick,
+                "self": own,
+                "account": msg.param(1).filter(|value| *value != "*"),
+                "realname": msg.param(2),
+            }),
+        );
     }
 
     fn on_part(&mut self, sid: usize, msg: &IrcMessage) {
@@ -1171,6 +1681,24 @@ impl App {
                 *joined = false;
             }
         }
+        let server_name = self
+            .server(sid)
+            .map(|server| server.display().to_string())
+            .unwrap_or_default();
+        self.plugin_event(
+            "part",
+            json!({
+                "server": sid,
+                "server_name": server_name,
+                "channel": channel,
+                "buffer": channel,
+                "target": channel,
+                "reply_target": channel,
+                "nick": nick,
+                "self": own,
+                "reason": reason,
+            }),
+        );
     }
 
     fn on_quit(&mut self, sid: usize, msg: &IrcMessage) {
@@ -1210,6 +1738,20 @@ impl App {
             }
             self.server_msg(sid, MsgKind::Info, "You quit the server");
         }
+        let server_name = self
+            .server(sid)
+            .map(|server| server.display().to_string())
+            .unwrap_or_default();
+        self.plugin_event(
+            "quit",
+            json!({
+                "server": sid,
+                "server_name": server_name,
+                "nick": nick,
+                "self": own,
+                "reason": reason,
+            }),
+        );
     }
 
     fn on_kick(&mut self, sid: usize, msg: &IrcMessage) {
@@ -1232,6 +1774,24 @@ impl App {
                 *joined = false;
             }
         }
+        let server_name = self
+            .server(sid)
+            .map(|server| server.display().to_string())
+            .unwrap_or_default();
+        self.plugin_event(
+            "kick",
+            json!({
+                "server": sid,
+                "server_name": server_name,
+                "channel": channel,
+                "buffer": channel,
+                "target": channel,
+                "reply_target": channel,
+                "nick": victim,
+                "by": by,
+                "reason": reason,
+            }),
+        );
     }
 
     fn on_nick(&mut self, sid: usize, msg: &IrcMessage) {
@@ -1286,6 +1846,21 @@ impl App {
                 self.push_system(bid, MsgKind::Nick, format!("{old} is now known as {new}"));
             }
         }
+        let server_name = self
+            .server(sid)
+            .map(|server| server.display().to_string())
+            .unwrap_or_default();
+        self.plugin_event(
+            "nick",
+            json!({
+                "server": sid,
+                "server_name": server_name,
+                "old": old,
+                "new": new,
+                "nick": new,
+                "self": own,
+            }),
+        );
     }
 
     fn on_topic(&mut self, sid: usize, msg: &IrcMessage) {
@@ -1310,6 +1885,23 @@ impl App {
             format!("{by} set the topic: {topic}")
         };
         self.push_system(bid, MsgKind::Topic, text);
+        let server_name = self
+            .server(sid)
+            .map(|server| server.display().to_string())
+            .unwrap_or_default();
+        self.plugin_event(
+            "topic",
+            json!({
+                "server": sid,
+                "server_name": server_name,
+                "channel": channel,
+                "buffer": channel,
+                "target": channel,
+                "reply_target": channel,
+                "topic": topic,
+                "nick": by,
+            }),
+        );
     }
 
     fn on_mode(&mut self, sid: usize, msg: &IrcMessage) {
@@ -1420,6 +2012,24 @@ impl App {
                 format!("{setter} sets mode {modes} on {target}"),
             );
         }
+        let server_name = self
+            .server(sid)
+            .map(|server| server.display().to_string())
+            .unwrap_or_default();
+        self.plugin_event(
+            "mode",
+            json!({
+                "server": sid,
+                "server_name": server_name,
+                "target": target,
+                "buffer": if is_channel { json!(target) } else { Value::Null },
+                "reply_target": if is_channel { json!(target) } else { Value::Null },
+                "modes": modes,
+                "args": msg.params.iter().skip(2).cloned().collect::<Vec<_>>(),
+                "setter": setter,
+                "is_channel": is_channel,
+            }),
+        );
     }
 
     fn on_away(&mut self, sid: usize, msg: &IrcMessage) {
@@ -1449,6 +2059,19 @@ impl App {
                 }
             }
         }
+        let server_name = self
+            .server(sid)
+            .map(|server| server.display().to_string())
+            .unwrap_or_default();
+        self.plugin_event(
+            "away",
+            json!({
+                "server": sid,
+                "server_name": server_name,
+                "nick": nick,
+                "away": away,
+            }),
+        );
     }
 
     fn on_account(&mut self, sid: usize, msg: &IrcMessage) {
@@ -1457,6 +2080,19 @@ impl App {
         };
         let account = msg.param(0).map(str::to_string).filter(|a| a != "*");
         self.update_member_meta(sid, &nick, |m| m.account = account.clone());
+        let server_name = self
+            .server(sid)
+            .map(|server| server.display().to_string())
+            .unwrap_or_default();
+        self.plugin_event(
+            "account",
+            json!({
+                "server": sid,
+                "server_name": server_name,
+                "nick": nick,
+                "account": account,
+            }),
+        );
     }
 
     fn on_chghost(&mut self, sid: usize, msg: &IrcMessage) {
@@ -2319,22 +2955,25 @@ impl App {
             return;
         }
         let partial: String = chars[1..cursor].iter().collect();
-        let matches: Vec<&str> = COMMANDS
-            .iter()
-            .filter(|c| c.starts_with(&partial))
-            .copied()
+        let mut names: Vec<String> = COMMANDS.iter().map(|name| name.to_string()).collect();
+        names.extend(self.plugins.command_names().into_iter().map(str::to_string));
+        names.sort();
+        names.dedup();
+        let matches: Vec<String> = names
+            .into_iter()
+            .filter(|command| command.starts_with(&partial))
             .collect();
         if matches.is_empty() {
             return;
         }
         if matches.len() == 1 {
-            let command = matches[0].to_string();
+            let command = matches[0].clone();
             chars.splice(1..cursor, format!("{command} ").chars());
             let new_text: String = chars.into_iter().collect();
             self.input.set_text(&new_text);
             return;
         }
-        let mut common = matches[0].to_string();
+        let mut common = matches[0].clone();
         for candidate in matches.iter().skip(1) {
             let len = common
                 .chars()
@@ -2353,8 +2992,8 @@ impl App {
             let new_text: String = chars.into_iter().collect();
             self.input.set_text(&new_text);
         }
-        let names: Vec<String> = matches.iter().map(|s| s.to_string()).collect();
-        self.toast(format!("matches: {}", names.join(" ")));
+        let names = matches.join(" ");
+        self.toast(format!("matches: {names}"));
     }
 
     fn complete_nick(&mut self) {
@@ -2493,8 +3132,16 @@ impl App {
             match cmd.as_str() {
                 "connect" | "server" => self.cmd_connect(rest),
                 "help" | "h" => self.menu = Some(help_menu()),
+                "plugins" => self.cmd_plugins(rest),
                 "q" | "quit" | "exit" => self.quit_all(rest),
-                _ => self.toast("no buffer selected"),
+                other => {
+                    if self.plugins.command(other).is_some() {
+                        let context = self.plugin_context();
+                        self.plugins.dispatch_command(other, rest, context);
+                    } else {
+                        self.toast("no buffer selected");
+                    }
+                }
             }
             return;
         };
@@ -2615,7 +3262,15 @@ impl App {
                 }
             }
             "help" | "h" => self.menu = Some(help_menu()),
-            other => self.toast(format!("unknown command: /{other}")),
+            "plugins" => self.cmd_plugins(rest),
+            other => {
+                if self.plugins.command(other).is_some() {
+                    let context = self.plugin_context();
+                    self.plugins.dispatch_command(other, rest, context);
+                } else {
+                    self.toast(format!("unknown command: /{other}"));
+                }
+            }
         }
     }
 
@@ -2849,6 +3504,112 @@ impl App {
             channels: Vec::new(),
         };
         self.start_server(cfg);
+    }
+
+    fn cmd_plugins(&mut self, rest: &str) {
+        match rest.trim().to_ascii_lowercase().as_str() {
+            "" => self.open_plugin_menu(),
+            "reload" => {
+                self.plugins.reload();
+                self.plugin_force_state = true;
+                self.toast("reloading plugins…");
+            }
+            "logs" | "log" => self.open_plugin_logs(),
+            _ => self.toast("usage: /plugins [reload|logs]"),
+        }
+    }
+
+    fn open_plugin_menu(&mut self) {
+        let mut menu = Menu::new("plugins");
+        menu.info
+            .push(format!("status   {}", self.plugins.status_text()));
+        menu.info.push(format!(
+            "python   {}",
+            self.plugins
+                .python_version
+                .clone()
+                .unwrap_or_else(|| "not detected".to_string())
+        ));
+        menu.info
+            .push(format!("data     {}", self.plugins.data_dir.display()));
+        menu.info.push(String::new());
+        for dir in &self.plugins.dirs {
+            menu.info.push(format!("dir      {}", dir.display()));
+        }
+        menu.info.push(String::new());
+        if self.plugins.plugins.is_empty() {
+            menu.info.push("no plugins loaded".to_string());
+        } else {
+            for plugin in &self.plugins.plugins {
+                let version = if plugin.version.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", plugin.version)
+                };
+                let description = if plugin.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", plugin.description)
+                };
+                menu.info.push(format!(
+                    "plugin   {}{}{}",
+                    plugin.name, version, description
+                ));
+            }
+        }
+        let commands = self.plugins.commands_sorted();
+        if !commands.is_empty() {
+            menu.info.push(String::new());
+            for command in commands.iter().take(30) {
+                menu.info.push(format!(
+                    "command  /{}  ({}){}",
+                    command.name,
+                    command.plugin,
+                    if command.help.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", command.help)
+                    }
+                ));
+            }
+        }
+        if !self.plugins.logs.is_empty() {
+            menu.info.push(String::new());
+            menu.info.push("recent log".to_string());
+            for line in self.plugins.logs.iter().rev().take(6).rev() {
+                menu.info.push(line.clone());
+            }
+        }
+        menu.info.push(String::new());
+        menu.actions.push(MenuAction::PluginReload);
+        menu.actions.push(MenuAction::PluginLogs);
+        menu.actions.push(MenuAction::Copy {
+            text: self
+                .plugins
+                .dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            label: "Copy plugin directories".to_string(),
+        });
+        menu.actions.push(MenuAction::Help);
+        menu.actions.push(MenuAction::CloseMenu);
+        self.menu = Some(menu);
+    }
+
+    fn open_plugin_logs(&mut self) {
+        let mut menu = Menu::new("plugin log");
+        if self.plugins.logs.is_empty() {
+            menu.info.push("no log entries yet".to_string());
+        } else {
+            for line in self.plugins.logs.iter().rev().take(40).rev() {
+                menu.info.push(line.clone());
+            }
+        }
+        menu.actions.push(MenuAction::PluginReload);
+        menu.actions.push(MenuAction::CloseMenu);
+        self.menu = Some(menu);
     }
 
     pub fn channel_name(&self, bid: usize) -> Option<String> {
@@ -3655,6 +4416,12 @@ impl App {
             }
             MenuAction::Reconnect(sid) => self.reconnect(sid),
             MenuAction::Disconnect(sid) => self.disconnect_server(sid),
+            MenuAction::PluginReload => {
+                self.plugins.reload();
+                self.plugin_force_state = true;
+                self.toast("reloading plugins…");
+            }
+            MenuAction::PluginLogs => self.open_plugin_logs(),
             MenuAction::Quit => self.quit_all(""),
             MenuAction::Help => self.menu = Some(help_menu()),
             MenuAction::CloseMenu => {}
@@ -4163,6 +4930,92 @@ mod tests {
             .as_ref()
             .map(|(text, _)| text.contains("plaintext"))
             .unwrap_or(false));
+    }
+
+    #[test]
+    fn plugin_menu_works_when_plugins_are_disabled() {
+        let (mut app, _rt) = demo_app();
+        app.run_command("plugins");
+        let menu = app.menu.as_ref().expect("plugin menu");
+        assert!(menu.info.iter().any(|line| line.contains("disabled")));
+    }
+
+    #[test]
+    fn plugin_command_reaches_the_app() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        if !crate::plugins::python_available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "rirc-app-plugin-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|value| value.as_millis())
+                .unwrap_or(0)
+        ));
+        let plugin_dir = root.join("plugins");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("apptest.py"),
+            r#"
+PLUGIN = {"name": "apptest", "version": "1.0"}
+
+def setup(api):
+    @api.command("apptest")
+    def apptest(api, args):
+        api.notify("apptest-ok")
+"#,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, _rx) = channel(64);
+        let cfg = Config {
+            demo: true,
+            plugins_enabled: true,
+            plugin_dirs: vec![plugin_dir.display().to_string()],
+            ..Default::default()
+        };
+        let mut app = App::new(cfg, Some(rt.handle().clone()), tx);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && !app.plugins.is_ready() {
+            app.poll_plugins();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            app.plugins.is_ready(),
+            "plugin host did not start: {:?}",
+            app.plugins.logs
+        );
+        assert!(app.plugins.command("apptest").is_some());
+
+        app.run_command("apptest");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            app.poll_plugins();
+            if app
+                .toast
+                .as_ref()
+                .map(|(text, _)| text.contains("apptest-ok"))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app
+            .toast
+            .as_ref()
+            .map(|(text, _)| text.contains("apptest-ok"))
+            .unwrap_or(false));
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

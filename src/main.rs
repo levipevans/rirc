@@ -10,6 +10,7 @@ mod list;
 mod menu;
 mod model;
 mod modes;
+mod plugins;
 mod ui;
 mod util;
 
@@ -51,6 +52,7 @@ fn main() {
     }
     if cfg.snapshot {
         cfg.demo = true;
+        cfg.plugins_enabled = false;
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -146,6 +148,7 @@ fn main() {
         std::process::exit(1);
     }
     // Give the connection tasks a moment to flush QUIT before the runtime dies.
+    app.plugins.shutdown();
     drop(app);
     std::thread::sleep(Duration::from_millis(150));
 }
@@ -227,6 +230,7 @@ fn event_loop(
             }
         }
         app.tick();
+        app.poll_plugins();
         terminal.draw(|frame| ui::draw(frame, app))?;
 
         if app.quit {

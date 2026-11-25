@@ -61,6 +61,8 @@ jobs:
           New-Item -ItemType Directory -Force "staging/$name" | Out-Null
           Copy-Item target/release/rirc.exe "staging/$name/rirc.exe"
           Copy-Item README.md,LICENSE "staging/$name/"
+          Copy-Item -Recurse plugins "staging/$name/plugins"
+          Copy-Item -Recurse docs "staging/$name/docs"
           Compress-Archive -Path "staging/$name/*" -DestinationPath "$name.zip"
           & .\target\release\rirc.exe --version
           gh release upload $env:TAG "$name.zip" --clobber
@@ -96,6 +98,7 @@ jobs:
           mkdir -p "staging/$name"
           cp "target/x86_64-unknown-linux-musl/release/rirc" "staging/$name/"
           cp README.md LICENSE "staging/$name/"
+          cp -R plugins docs "staging/$name/"
           tar -C staging -czf "$name.tar.gz" "$name"
           file "target/x86_64-unknown-linux-musl/release/rirc"
           "target/x86_64-unknown-linux-musl/release/rirc" --version
@@ -131,6 +134,7 @@ jobs:
           name="rirc-${TAG}-macos-universal"
           mkdir -p "staging/$name"
           cp rirc README.md LICENSE "staging/$name/"
+          cp -R plugins docs "staging/$name/"
           tar -C staging -czf "$name.tar.gz" "$name"
           gh release upload "$TAG" "$name.tar.gz" --clobber
 

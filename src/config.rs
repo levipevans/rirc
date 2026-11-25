@@ -19,6 +19,8 @@ pub struct Config {
     pub version: bool,
     pub nick: String,
     pub start: Option<ServerConfig>,
+    pub plugins_enabled: bool,
+    pub plugin_dirs: Vec<String>,
 }
 
 pub const USAGE: &str = "\
@@ -37,6 +39,8 @@ OPTIONS:
                                  password is read from $RIRC_PASS
         --pass <PASS>            Server password (PASS command)
     -c, --channel <CHANNEL>      Auto-join; repeat or comma-separate
+        --plugin-dir <DIR>       Extra plugin directory; repeatable
+        --no-plugins             Disable the Python plugin host
         --demo                   Start with a local demo session
         --snapshot               Render a demo frame to stdout and exit
     -h, --help                   Show this help
@@ -101,6 +105,7 @@ fn channels_from(value: &str) -> Vec<String> {
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> {
     let mut config = Config {
         nick: default_nick(),
+        plugins_enabled: true,
         ..Default::default()
     };
 
@@ -119,6 +124,13 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
             "-V" | "--version" => config.version = true,
             "--demo" => config.demo = true,
             "--snapshot" => config.snapshot = true,
+            "--no-plugins" => config.plugins_enabled = false,
+            "--plugin-dir" => {
+                config.plugin_dirs.push(
+                    iter.next()
+                        .ok_or_else(|| "--plugin-dir needs a value".to_string())?,
+                );
+            }
             "--tls" => tls = Some(true),
             "--no-tls" => tls = Some(false),
             "-s" | "--server" => {
@@ -176,6 +188,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
                     nick = Some(value.to_string());
                 } else if let Some(value) = other.strip_prefix("--channel=") {
                     channels.extend(channels_from(value));
+                } else if let Some(value) = other.strip_prefix("--plugin-dir=") {
+                    config.plugin_dirs.push(value.to_string());
                 } else if other.starts_with('-') {
                     return Err(format!("unknown option: {other}"));
                 } else if server.is_none() {
@@ -297,5 +311,15 @@ mod tests {
     fn allows_credentials_with_tls() {
         let cfg = parse_args(args(&["-s", "example.org", "--pass", "secret"])).unwrap();
         assert!(cfg.start.unwrap().tls);
+    }
+
+    #[test]
+    fn parses_plugin_options() {
+        let cfg = parse_args(args(&["--plugin-dir", "one", "--plugin-dir=two"])).unwrap();
+        assert!(cfg.plugins_enabled);
+        assert_eq!(cfg.plugin_dirs, vec!["one", "two"]);
+
+        let cfg = parse_args(args(&["--no-plugins"])).unwrap();
+        assert!(!cfg.plugins_enabled);
     }
 }

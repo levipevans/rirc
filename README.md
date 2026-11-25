@@ -23,6 +23,9 @@ modal editing. Rust, `ratatui`, no daemon, no config file.
   copies a multi-message selection with timestamps.
 - **Channel browser**: `/list` collects the network's channel list into a
   filterable full-screen view; `l` joins, `Enter` opens a channel menu.
+- **Python plugins**: drop a `.py` file in a `plugins/` folder, run
+  `/plugins reload`, and add commands, hooks, timers and IRC actions. See
+  [docs/PLUGINS.md](docs/PLUGINS.md).
 - IRCv3: `CAP LS 302`, message tags, server-time, multi-prefix, away-notify,
   extended-join, account-tag, SASL PLAIN, TLS. Local echo, unread/mention
   badges, member modes, WHOIS popups, mouse support.
@@ -65,6 +68,8 @@ not reused when the requested transport differs.
     --sasl <USER:PASS>       SASL PLAIN; omit PASS to read $RIRC_PASS
     --pass <PASS>            server password (PASS command)
 -c, --channel <CHANNEL>      auto-join; repeat or comma-separate
+    --plugin-dir <DIR>       extra plugin directory; repeatable
+    --no-plugins             disable the Python plugin host
     --demo                   local sample session
     --snapshot               render demo frames to stdout and exit
 -h, --help                   usage
@@ -103,6 +108,31 @@ it scrolls the message view).
 Menus are keyboard driven: `j`/`k` move, `Enter` select, `y` copy the info
 text, digits jump, `Esc` closes.
 
+## Plugins
+
+Drop a Python file into a `plugins/` folder next to the executable, in the
+current directory, or in the per-user config directory, then run
+`/plugins reload`. Plugins can register slash commands, react to messages and
+joins, read recent state, send IRC messages, use timers, and store persistent
+data.
+
+```python
+PLUGIN = {"name": "hello", "version": "1.0"}
+def setup(api):
+    @api.command("hello")
+    def hello(api, args):
+        api.reply("hello from Python")
+```
+
+- Host status, commands and errors: `/plugins`
+- Logs: `/plugins logs`
+- Reload: `/plugins reload`
+- Full API and installation guide: [docs/PLUGINS.md](docs/PLUGINS.md)
+- Examples: [`plugins/`](plugins/)
+
+Python 3 is optional. If it is unavailable, rirc runs normally and `/plugins`
+explains the problem. Plugins are trusted code; they are not sandboxed.
+
 ## Clipboard
 
 Yank writes to the native clipboard (`clip.exe`, `pbcopy`, `wl-copy`,
@@ -123,6 +153,7 @@ outer terminal.
 /list [server-side-filter]
 /close                   /connect <host[:port]>    /disconnect
 /reconnect               /raw <line>               /help
+/plugins [reload|logs]
 /quit
 ```
 
@@ -174,6 +205,10 @@ cargo run -- --snapshot
 | `src/list.rs` | `/list` results, filtering and selection |
 | `src/input.rs` | single-line editor, history, completion primitives |
 | `src/clipboard.rs` | native + OSC 52 clipboard |
+| `src/plugins.rs` | Python host process, protocol, command registry |
+| `src/plugin_host.py` | embedded Python host and plugin API runtime |
+| `docs/PLUGINS.md` | plugin author documentation |
+| `plugins/` | loadable example plugins |
 | `src/demo.rs` | deterministic sample session |
 | `src/util.rs` | wrapping, case folding, mention detection, colors |
 
