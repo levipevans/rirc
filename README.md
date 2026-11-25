@@ -27,6 +27,12 @@ modal editing. Rust, `ratatui`, no daemon, no config file.
   extended-join, account-tag, SASL PLAIN, TLS. Local echo, unread/mention
   badges, member modes, WHOIS popups, mouse support.
 
+## Download
+
+Prebuilt Windows (x86_64) builds are attached to the
+[latest release](https://github.com/levipevans/rirc/releases/latest).
+On Linux and macOS, build from source with `cargo build --release`.
+
 ## Build & run
 
 ```sh
