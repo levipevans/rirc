@@ -4,16 +4,24 @@ version = "0.1.0"
 edition = "2021"
 description = "A tiny, vim-flavoured IRCv3 client for the terminal"
 license = "MIT"
+repository = "https://github.com/levipevans/rirc"
+homepage = "https://github.com/levipevans/rirc"
 
 [dependencies]
 ratatui = "0.29.0"
 crossterm = "0.28.1"
 chrono = "0.4"
 base64 = "0.22"
-native-tls = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 tokio-native-tls = "0.3"
 unicode-width = "0.2"
+
+# Link OpenSSL statically on Linux so the published binary is portable.
+[target.'cfg(target_os = "linux")'.dependencies]
+native-tls = { version = "0.2", features = ["vendored"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+native-tls = "0.2"
 
 [profile.release]
 opt-level = 2

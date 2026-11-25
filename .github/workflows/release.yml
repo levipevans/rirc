@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (for example v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; reusing it."
+          else
+            gh release create "$TAG" --verify-tag --draft \
+              --title "rirc $TAG" \
+              --notes-file .github/release-notes.md
+          fi
+
+  windows:
+    name: Windows x86_64
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package and upload
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          $name = "rirc-$env:TAG-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force "staging/$name" | Out-Null
+          Copy-Item target/release/rirc.exe "staging/$name/rirc.exe"
+          Copy-Item README.md,LICENSE "staging/$name/"
+          Compress-Archive -Path "staging/$name/*" -DestinationPath "$name.zip"
+          & .\target\release\rirc.exe --version
+          gh release upload $env:TAG "$name.zip" --clobber
+
+  linux:
+    name: Linux x86_64 (static)
+    needs: create-release
+    runs-on: ubuntu-latest
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      AR_x86_64_unknown_linux_musl: ar
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential musl-tools perl make
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Package and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          name="rirc-${TAG}-x86_64-unknown-linux-musl"
+          mkdir -p "staging/$name"
+          cp "target/x86_64-unknown-linux-musl/release/rirc" "staging/$name/"
+          cp README.md LICENSE "staging/$name/"
+          tar -C staging -czf "$name.tar.gz" "$name"
+          file "target/x86_64-unknown-linux-musl/release/rirc"
+          "target/x86_64-unknown-linux-musl/release/rirc" --version
+          gh release upload "$TAG" "$name.tar.gz" --clobber
+
+  macos:
+    name: macOS universal
+    needs: create-release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Add macOS targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Package and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          lipo -create -output rirc \
+            target/aarch64-apple-darwin/release/rirc \
+            target/x86_64-apple-darwin/release/rirc
+          file rirc
+          ./rirc --version
+          name="rirc-${TAG}-macos-universal"
+          mkdir -p "staging/$name"
+          cp rirc README.md LICENSE "staging/$name/"
+          tar -C staging -czf "$name.tar.gz" "$name"
+          gh release upload "$TAG" "$name.tar.gz" --clobber
+
+  publish:
+    name: Checksums and publish
+    needs:
+      - windows
+      - linux
+      - macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add checksums and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          gh release download "$TAG" --dir assets
+          cd assets
+          rm -f SHA256SUMS.txt
+          sha256sum * > SHA256SUMS.txt
+          gh release upload "$TAG" SHA256SUMS.txt --clobber
+          gh release edit "$TAG" --draft=false --latest
